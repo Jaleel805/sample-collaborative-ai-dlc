@@ -281,6 +281,10 @@ export interface ComposeSession {
   // Apply writes values that scope really authors. Absent for a proposal that
   // resolved none.
   settingsScope?: string;
+  // That scope's authored defaults, the map Apply normalises the accepted values
+  // against. Absent for a proposal that resolved no settings scope, and on a
+  // proposal recorded before the defaults were.
+  settingsAuthored?: Record<string, AidlcSettingValue>;
   failureReason: string | null;
   createdAt: string | null;
   updatedAt: string | null;

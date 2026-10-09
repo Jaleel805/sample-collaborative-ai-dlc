@@ -821,10 +821,12 @@ const mapCompose = (c) => ({
   reportKey: c.reportKey ?? null,
   proposal: c.proposal ?? null,
   validation: c.validation ?? null,
-  // The scope whose authored settings this proposal was validated against, so
-  // Apply normalises the accepted values against the same authored map the
-  // validation used. Omitted for a proposal that resolved none.
+  // The scope whose authored settings this proposal was validated against, and
+  // that scope's authored defaults, so Apply normalises the accepted values
+  // against the same authored map the validation used. Omitted for a proposal
+  // that resolved none.
   ...(c.settingsScope ? { settingsScope: c.settingsScope } : {}),
+  ...(c.settingsAuthored ? { settingsAuthored: c.settingsAuthored } : {}),
   failureReason: c.failureReason ?? null,
   createdAt: c.createdAt ?? null,
   updatedAt: c.updatedAt ?? null,

@@ -2954,6 +2954,33 @@ describe('POST /compose — composer sessions', () => {
     expect(JSON.parse(detail.body).composes).toHaveLength(1);
   });
 
+  // Apply normalises the accepted values against the defaults the proposal was
+  // validated against, so the row's settings scope and those defaults reach the
+  // wire together.
+  it('GET /composes carries the settings scope and defaults a proposal was validated against', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedComposeFixtures();
+    const intent = JSON.parse(
+      (await createIntent(sub, projectId, { title: 'I', prompt: 'hotfix the crash' })).body,
+    );
+    await composeReq(sub, projectId, intent.id);
+    const row = [...procStore.values()].find((i) => (i.sk || '').startsWith('COMPOSE#'));
+    row.settingsScope = 'bugfix';
+    row.settingsAuthored = { guardPolicy: 'strict', collaborators: 'off' };
+
+    const list = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}/composes`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+
+    const [compose] = JSON.parse(list.body).composes;
+    expect(compose.settingsScope).toBe('bugfix');
+    expect(compose.settingsAuthored).toEqual({ guardPolicy: 'strict', collaborators: 'off' });
+  });
+
   it('presigns a namespaced report upload for a DRAFT', async () => {
     vi.stubEnv('ARTIFACTS_BUCKET', 'artifacts-test');
     try {

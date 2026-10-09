@@ -117,8 +117,10 @@ const unauthoredProposalSettings = ({ proposal, scopeBlocks, settingsScope }) =>
 };
 
 // Validate a parsed proposal through the plan resolver — the ONLY authority.
-// Returns { validation, settingsScope } (authoritative verdict for a runnable
-// proposal) or { error, validation } when the proposal is not runnable.
+// Returns { validation, settingsScope, settingsAuthored } (authoritative verdict
+// for a runnable proposal, with the scope its settings were checked against and
+// that scope's authored defaults) or { error, validation } when the proposal is
+// not runnable.
 const validateProposal = ({
   proposal,
   workflow,
@@ -136,6 +138,14 @@ const validateProposal = ({
   strict = false,
 }) => {
   const settingsScope = settingsAware ? settingsScopeFor({ proposal, policyScope }) : null;
+  const accepted = (validation) =>
+    settingsScope
+      ? {
+          validation,
+          settingsScope,
+          settingsAuthored: scopeAidlcSettings(scopeBlockFor(scopeBlocks, settingsScope)),
+        }
+      : { validation, settingsScope };
   const settingsError = () => {
     if (!settingsAware) return null;
     const unauthored = unauthoredProposalSettings({ proposal, scopeBlocks, settingsScope });
@@ -156,7 +166,7 @@ const validateProposal = ({
     const validation = { valid, errors, warnings, summary: plan?.summary ?? null };
     if (!valid) return { error: 'matched scope does not resolve', validation };
     const unauthored = settingsError();
-    return unauthored ? { error: unauthored, validation } : { validation, settingsScope };
+    return unauthored ? { error: unauthored, validation } : accepted(validation);
   }
   if (settingsAware && proposal.baseScope && !offeredScopeIds.includes(proposal.baseScope)) {
     return { error: `proposal baseScope "${proposal.baseScope}" is not offered by this workflow` };
@@ -172,7 +182,7 @@ const validateProposal = ({
   const validation = { valid, errors, warnings, summary: plan?.summary ?? null };
   if (!valid) return { error: 'proposed grid does not resolve', validation };
   const unauthored = settingsError();
-  return unauthored ? { error: unauthored, validation } : { validation, settingsScope };
+  return unauthored ? { error: unauthored, validation } : accepted(validation);
 };
 
 const MODE_TASKS = {
@@ -524,6 +534,7 @@ export const createComposePlanStart = ({
         const {
           validation,
           settingsScope,
+          settingsAuthored,
           error: validationError,
         } = validateProposal({
           proposal,
@@ -545,13 +556,18 @@ export const createComposePlanStart = ({
           });
           return;
         }
-        // The settings scope the proposal was validated against is recorded on
-        // the row, so Apply normalises the accepted values against the SAME
-        // authored map the validation used instead of re-deriving one that may
-        // since have changed.
+        // The settings scope the proposal was validated against, and that
+        // scope's authored defaults, are recorded on the row, so Apply
+        // normalises the accepted values against the SAME authored map the
+        // validation used instead of re-deriving one from whatever selection
+        // the page happens to preview.
         await finish({
           state: 'COMPLETED',
-          fields: { proposal, validation, ...(settingsScope ? { settingsScope } : {}) },
+          fields: {
+            proposal,
+            validation,
+            ...(settingsScope ? { settingsScope, settingsAuthored } : {}),
+          },
         });
       } catch (err) {
         log(`job failed (${key}):`, err?.message ?? err);

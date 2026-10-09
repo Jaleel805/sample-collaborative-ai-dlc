@@ -1081,6 +1081,71 @@ describe('IntentComposePage — applying a composed plan with its settings', () 
     expect(applyComposedSelection).toHaveBeenCalledWith({ scope: 'feature', aidlcSettings: null });
   });
 
+  // The proposal was validated against the defaults of ITS settings scope, which
+  // the compose row records. Those are the defaults Apply normalizes against —
+  // not the ones of whatever selection the page happens to be previewing. Here
+  // the page previews `feature` (Guard Policy off by default) while the
+  // proposal runs a custom grid on `bugfix` (strict by default): accepting
+  // Guard Policy off is a real override of bugfix's strict default and must
+  // reach the selection, or the run would execute strict.
+  it('normalizes against the defaults the proposal was validated against, not the previewed ones', async () => {
+    const user = userEvent.setup();
+    const grid = { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' };
+    draftState.scope = 'feature-custom';
+    draftState.policyScope = 'feature';
+    draftState.composedGrid = grid;
+    withProposal(
+      {
+        mode: 'custom',
+        scope: 'feature-custom',
+        grid,
+        baseScope: 'bugfix',
+        guardPolicy: 'off',
+        scopeSettings: { collaborators: 'off' },
+      },
+      {
+        settingsScope: 'bugfix',
+        settingsAuthored: { guardPolicy: 'strict', collaborators: 'off' },
+      },
+    );
+
+    renderPage();
+    await screen.findByTestId('proposal-apply');
+    await waitFor(() => expect(validateGrid).toHaveBeenCalled());
+    await user.click(screen.getByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'feature-custom',
+      composedGrid: grid,
+      policyScope: 'bugfix',
+      aidlcSettings: { guardPolicy: 'off' },
+    });
+  });
+
+  // A preview still loading — for instance just after a scope change — must
+  // not decide what Apply keeps: the recorded defaults already answer it.
+  it('normalizes a matched proposal while the preview is still loading', async () => {
+    const user = userEvent.setup();
+    executionPreview.mockReset().mockReturnValue(new Promise(() => {}));
+    withProposal(
+      {
+        mode: 'matched',
+        scope: 'feature',
+        guardPolicy: 'off',
+        scopeSettings: { collaborators: 'on' },
+      },
+      { settingsScope: 'feature', settingsAuthored: { guardPolicy: 'off', collaborators: 'off' } },
+    );
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'feature',
+      aidlcSettings: { collaborators: 'on' },
+    });
+  });
+
   it('sends no settings for a proposal that proposed none', async () => {
     const user = userEvent.setup();
     withProposal({ mode: 'matched', scope: 'bugfix' });

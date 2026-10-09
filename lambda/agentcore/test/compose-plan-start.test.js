@@ -736,6 +736,14 @@ describe('validateProposal — the settings scope of every proposal mode', () =>
     expect(ok.settingsScope).toBe('feature');
   });
 
+  // Apply normalises the accepted values against the defaults the validation
+  // used, so the validation returns them beside the scope it read them from.
+  it('returns the settings defaults of the scope a proposal was validated against', () => {
+    const ok = validate({ ...matched({ scope: 'feature' }), guardPolicy: 'relaxed' });
+
+    expect(ok.settingsAuthored).toEqual({ guardPolicy: 'strict', planApproval: 'on' });
+  });
+
   it('resolves an explicit base scope for a custom proposal', () => {
     expect(settingsScopeFor({ proposal: custom({ baseScope: 'feature' }) })).toBe('feature');
 
@@ -790,6 +798,7 @@ describe('validateProposal — the settings scope of every proposal mode', () =>
     const matchedOk = validate(matched({ guardPolicy: 'strict' }), notAware);
     expect(matchedOk.error).toBeUndefined();
     expect(matchedOk.settingsScope).toBeNull();
+    expect(matchedOk).not.toHaveProperty('settingsAuthored');
 
     const customOk = validate(custom({ guardPolicy: 'relaxed' }), notAware);
     expect(customOk.error).toBeUndefined();
@@ -855,6 +864,7 @@ describe('compose-plan-start — a proposal is refused for an unauthored setting
 
     expect(update.state).toBe('COMPLETED');
     expect(update.fields.settingsScope).toBe('bugfix');
+    expect(update.fields.settingsAuthored).toEqual({ planApproval: 'on' });
     expect(update.fields.proposal.scopeSettings).toEqual({ plan_approval: 'on' });
   });
 });

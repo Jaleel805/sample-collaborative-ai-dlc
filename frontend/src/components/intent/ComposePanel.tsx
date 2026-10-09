@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { intentsService, type ComposeSession } from '@/services/intents';
-import { CHOOSABLE_SCOPE_SETTINGS } from '@/lib/aidlcSettings';
+import { CHOOSABLE_SCOPE_SETTINGS, type AidlcSettingValue } from '@/lib/aidlcSettings';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
@@ -20,12 +20,14 @@ interface Props {
   disabled?: boolean;
   /**
    * Human accepts the proposal — write it into the shared draft selection. The
-   * settings scope the proposal was validated against rides along, so the
-   * accepted values are written for the scope that really authors them.
+   * settings scope the proposal was validated against rides along with that
+   * scope's authored defaults, so the accepted values are written for the
+   * scope that really authors them and normalized against its own defaults.
    */
   onApply: (
     proposal: NonNullable<ComposeSession['proposal']>,
     settingsScope: string | null,
+    settingsAuthored: Record<string, AidlcSettingValue> | null,
   ) => void;
 }
 
@@ -284,7 +286,11 @@ export function ComposePanel({ projectId, intentId, agentCli, disabled, onApply 
                 // Apply is a local, synchronous, total operation: the card is
                 // Applied because the transaction committed, not because a
                 // request was started.
-                onApply(latest.proposal!, latest.settingsScope ?? null);
+                onApply(
+                  latest.proposal!,
+                  latest.settingsScope ?? null,
+                  latest.settingsAuthored ?? null,
+                );
                 setAppliedId(latest.composeId);
               }}
               disabled={disabled || appliedId === latest.composeId}

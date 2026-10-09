@@ -506,6 +506,7 @@ function IntentComposePageContent() {
   const applyProposal = (
     proposal: NonNullable<ComposeSession['proposal']>,
     settingsScope: string | null,
+    settingsAuthored: Record<string, AidlcSettingValue> | null,
   ) => {
     if (!draftReady) return;
     // Only a catalog that authors these settings can store one, so a value a
@@ -520,21 +521,30 @@ function IntentComposePageContent() {
     // those windows dropped every value the job had already validated.
     const catalogSettingsAware = settingsAware || settingsScope !== null;
     const proposed = catalogSettingsAware ? aidlcSettingsFromComposeProposal(proposal) : {};
-    // A proposal for the selection already in force changes no selection, so no
-    // preview re-runs to prune it. Normalize it here against the authored map
-    // of that selection, so a value equal to its default is not kept as a
-    // choice that would become an override of the next scope's own default.
+    // Only overrides are stored. The proposal was validated against the
+    // authored defaults of its settings scope, recorded beside it, so its
+    // values are normalized against exactly those before they enter the shared
+    // document: a value equal to that scope's default is not kept as a choice
+    // that would become an override of a later scope's own default, and a real
+    // override of it is kept whatever selection the page is previewing, or
+    // whether a preview has landed at all.
+    //
+    // A proposal recorded before those defaults were carries only its settings
+    // scope. For it, the current preview's defaults are used when they describe
+    // the same selection and base scope; otherwise its values are written as
+    // proposed and the preview of the new selection prunes them.
     const selectionUnchanged =
       proposal.mode === 'matched'
         ? proposal.scope === scope && !draft.composedGrid
         : proposal.scope === scope &&
+          (settingsScope ?? proposal.baseScope ?? customizationBaseScope) === draft.policyScope &&
           JSON.stringify(proposal.grid ?? null) === JSON.stringify(draft.composedGrid ?? null);
-    const aidlcSettings =
-      selectionUnchanged && authoredSettings
-        ? normalizeAidlcSettings({ settings: proposed, authored: authoredSettings }).value
-        : Object.keys(proposed).length > 0
-          ? proposed
-          : null;
+    const authoredForApply = settingsAuthored ?? (selectionUnchanged ? authoredSettings : null);
+    const aidlcSettings = authoredForApply
+      ? normalizeAidlcSettings({ settings: proposed, authored: authoredForApply }).value
+      : Object.keys(proposed).length > 0
+        ? proposed
+        : null;
     if (proposal.mode === 'matched') {
       draft.applyComposedSelection({ scope: proposal.scope, aidlcSettings });
       return;

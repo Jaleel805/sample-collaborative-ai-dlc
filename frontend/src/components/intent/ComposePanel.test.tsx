@@ -102,7 +102,12 @@ describe('ComposePanel — the composer settings proposal', () => {
   it('reports the proposal and its settings scope on Apply, then disables retry', async () => {
     const user = userEvent.setup();
     listComposes.mockResolvedValue({
-      composes: [session({ guardPolicy: 'strict' }, { settingsScope: 'classic' })],
+      composes: [
+        session(
+          { guardPolicy: 'strict' },
+          { settingsScope: 'classic', settingsAuthored: { guardPolicy: 'off' } },
+        ),
+      ],
     });
     renderPanel();
 
@@ -112,6 +117,7 @@ describe('ComposePanel — the composer settings proposal', () => {
     expect(onApply).toHaveBeenCalledTimes(1);
     expect(onApply.mock.calls[0][0]).toMatchObject({ guardPolicy: 'strict' });
     expect(onApply.mock.calls[0][1]).toBe('classic');
+    expect(onApply.mock.calls[0][2]).toEqual({ guardPolicy: 'off' });
     expect(screen.getByTestId('proposal-apply')).toBeDisabled();
   });
 
