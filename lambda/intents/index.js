@@ -339,6 +339,13 @@ const composeReportPrefix = (intentId) => `compose-reports/${intentId}/`;
 // Composer one-shots run in a THROWAWAY session keyed by the compose id — see
 // the compose dispatch below for the field incident this avoids.
 const runtimeSessionIdFor = intentSessionIdFor;
+
+// The stock scope a compose should be grounded in: the recorded base of a
+// composed grid, or the scope of a selection that names one directly. A
+// customization with NO recorded base has none — its `scope` is a display label
+// that names no SCOPE block, so grounding the composer in it would describe a
+// scope that does not exist and invite a proposal the draft write then refuses.
+const composePolicyScope = (meta) => meta.policyScope ?? (meta.composedGrid ? null : meta.scope);
 const invokeSourceControl = async (input) => {
   if (!SOURCE_CONTROL_FN()) {
     throw Object.assign(new Error('Source-control service is not configured'), {
@@ -3862,6 +3869,12 @@ export const handler = async (event, context) => {
                 ...(frozenGrid && Object.keys(frozenGrid).length ? { frozenGrid } : {}),
                 ...(progressContext ? { progressContext } : {}),
                 ...(meta.methodologyRelease ? { methodologyRelease: meta.methodologyRelease } : {}),
+                // The settings this intent already runs with, and the scope
+                // whose own values they override. The composer is grounded in
+                // the EFFECTIVE values rather than the subset a member changed,
+                // which is what lets the annex forbid it reading them off disk.
+                ...(meta.aidlcSettings ? { aidlcSettings: meta.aidlcSettings } : {}),
+                ...(composePolicyScope(meta) ? { policyScope: composePolicyScope(meta) } : {}),
                 ...(meta.methodologyRelease && meta.methodologyPins
                   ? { methodologyPins: meta.methodologyPins }
                   : {}),
