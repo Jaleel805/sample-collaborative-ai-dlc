@@ -43,7 +43,7 @@ import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { createProcessStore } from '../shared/v2-process-store.js';
 import { eventTypeOf } from '../shared/v2-process-keys.js';
 import { loadExecutionPlan } from '../shared/v2-workflow-plan.js';
-import { intentMethodologyOptions } from '../shared/intent-methodology.js';
+import { intentMethodologyOptions, planProjectionOptions } from '../shared/intent-methodology.js';
 import {
   planSegments,
   stageInstanceId as planStageInstanceId,
@@ -693,9 +693,15 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
       loadPlan({
         workflowId,
         workflowVersion,
-        scope,
-        ...(intentSkipIds.length ? { skipStageIds: intentSkipIds } : {}),
-        ...(composedGrid ? { composedGrid } : {}),
+        // ONE projection contract with the intents API and the container (see
+        // shared/intent-methodology.js): the scope, the skip overlay, the grid
+        // and the per-intent AI-DLC settings all come from the same list, so a
+        // recorded setting cannot be validated at create and then dropped here.
+        ...planProjectionOptions(meta, {
+          scope,
+          ...(intentSkipIds.length ? { skipStageIds: intentSkipIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+        }),
         ...intentMethodologyOptions(meta, { s3, bucket: ARTIFACTS_BUCKET }),
       }),
     );
@@ -903,6 +909,10 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         scope,
         ...(allSkipIds.length ? { skipStageIds: allSkipIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
+        // The container resolves its OWN plan, so the projection has to ride the
+        // dispatch too or the stage would materialize under the scope defaults
+        // while the walk gated on the member's recorded choices.
+        ...(meta.aidlcSettings ? { intentSettings: meta.aidlcSettings } : {}),
         cliModels,
         tierModels,
         requestedCli,
@@ -2516,6 +2526,9 @@ const runStage = async (
     skipStageIds = null,
     // Per-intent composed grid — forwarded for the same plan-parity reason.
     composedGrid = null,
+    // Per-intent AI-DLC settings — forwarded for the same plan-parity reason:
+    // the container resolves its own plan and must resolve the same policy.
+    intentSettings = null,
     cliModels,
     tierModels = null,
     requestedCli,
@@ -2586,6 +2599,7 @@ const runStage = async (
         scope,
         ...(skipStageIds?.length ? { skipStageIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
+        ...(intentSettings ? { intentSettings } : {}),
         ...(cliModels ? { cliModels } : {}),
         ...(tierModels ? { tierModels } : {}),
         ...(requestedCli ? { requestedCli } : {}),
