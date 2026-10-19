@@ -549,6 +549,44 @@ describe('gitlab provider — repo browse + MR + token refresh', () => {
     ]);
   });
 
+  it('listRepos follows pages until a short page', async () => {
+    const project = (n) => ({
+      id: n,
+      name: `p${n}`,
+      path_with_namespace: `g/p${n}`,
+      visibility: 'private',
+      default_branch: 'main',
+    });
+    const fetchImpl = makeFetch([
+      ['&page=1&', { json: Array.from({ length: 100 }, (_, i) => project(i)) }],
+      ['&page=2&', { json: [project(100), project(101)] }],
+    ]);
+    const repos = await gl.listRepos({ token: 't', fetchImpl });
+    expect(repos).toHaveLength(102);
+    expect(repos.at(-1).fullName).toBe('g/p101');
+    expect(fetchImpl.calls).toHaveLength(2);
+  });
+
+  it('listRepos stops at the page cap', async () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({
+      id: i,
+      name: `p${i}`,
+      path_with_namespace: `g/p${i}`,
+      visibility: 'private',
+    }));
+    const fetchImpl = makeFetch([['/projects?membership', { json: full }]]);
+    const repos = await gl.listRepos({ token: 't', fetchImpl });
+    expect(fetchImpl.calls).toHaveLength(10);
+    expect(repos).toHaveLength(1000);
+  });
+
+  it('listRepos surfaces a GitLab error body', async () => {
+    const fetchImpl = makeFetch([
+      ['/projects?membership', { status: 403, json: { message: '403 Forbidden' } }],
+    ]);
+    await expect(gl.listRepos({ token: 't', fetchImpl })).rejects.toThrow('403 Forbidden');
+  });
+
   it('glFetch refreshes the token once on 401 and retries', async () => {
     let calls = 0;
     const fetchImpl = async (url, options) => {

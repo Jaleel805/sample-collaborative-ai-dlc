@@ -183,14 +183,25 @@ const mapRepo = (r) => ({
   defaultBranch: r.default_branch,
 });
 
+// The picker filters this list client-side, so it must hold every project the
+// caller can push to, not just the first page. Pages are capped so a user in
+// a very large instance still answers inside the API Gateway 29s limit.
+const REPO_PAGE_SIZE = 100;
+const REPO_MAX_PAGES = 10;
+
 const listRepos = async (ctx) => {
-  const res = await glFetch(
-    ctx,
-    `${API_BASE}/projects?membership=true&min_access_level=30&per_page=100&order_by=last_activity_at`,
-  );
-  const repos = await res.json();
-  if (!Array.isArray(repos)) {
-    throw new ProviderError(400, repos.message || repos.error || 'Failed to fetch projects');
+  const repos = [];
+  for (let page = 1; page <= REPO_MAX_PAGES; page += 1) {
+    const res = await glFetch(
+      ctx,
+      `${API_BASE}/projects?membership=true&min_access_level=30&per_page=${REPO_PAGE_SIZE}&page=${page}&order_by=last_activity_at`,
+    );
+    const data = await res.json();
+    if (!Array.isArray(data)) {
+      throw new ProviderError(400, data?.message || data?.error || 'Failed to fetch projects');
+    }
+    repos.push(...data);
+    if (data.length < REPO_PAGE_SIZE) break;
   }
   return repos.map(mapRepo);
 };
