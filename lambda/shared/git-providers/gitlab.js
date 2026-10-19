@@ -189,21 +189,35 @@ const mapRepo = (r) => ({
 const REPO_PAGE_SIZE = 100;
 const REPO_MAX_PAGES = 10;
 
-const listRepos = async (ctx) => {
-  const repos = [];
-  for (let page = 1; page <= REPO_MAX_PAGES; page += 1) {
-    const res = await glFetch(
-      ctx,
-      `${API_BASE}/projects?membership=true&min_access_level=30&per_page=${REPO_PAGE_SIZE}&page=${page}&order_by=last_activity_at`,
-    );
-    const data = await res.json();
-    if (!Array.isArray(data)) {
-      throw new ProviderError(400, data?.message || data?.error || 'Failed to fetch projects');
-    }
-    repos.push(...data);
-    if (data.length < REPO_PAGE_SIZE) break;
+const fetchRepoPage = async (ctx, page) => {
+  const res = await glFetch(
+    ctx,
+    `${API_BASE}/projects?membership=true&min_access_level=30&per_page=${REPO_PAGE_SIZE}&page=${page}&order_by=last_activity_at`,
+  );
+  const data = await res.json();
+  if (!Array.isArray(data)) {
+    throw new ProviderError(400, data?.message || data?.error || 'Failed to fetch projects');
   }
-  return repos.map(mapRepo);
+  // Map straight away: a full project object is ~7KB, the mapped one ~100B.
+  return {
+    repos: data.map(mapRepo),
+    totalPages: Number(res.headers?.get?.('x-total-pages')) || null,
+  };
+};
+
+// Page 1 goes first and alone: it settles any 401 token refresh (GitLab
+// refresh tokens are single-use, so parallel refreshes would race) and its
+// X-Total-Pages header bounds the rest. A full GitLab project page takes ~5s,
+// so the remaining pages are fetched in parallel rather than in sequence.
+// GitLab omits X-Total-Pages above 10,000 results; then fetch up to the cap.
+const listRepos = async (ctx) => {
+  const first = await fetchRepoPage(ctx, 1);
+  if (first.repos.length < REPO_PAGE_SIZE) return first.repos;
+  const lastPage = Math.min(first.totalPages ?? REPO_MAX_PAGES, REPO_MAX_PAGES);
+  const pages = [];
+  for (let page = 2; page <= lastPage; page += 1) pages.push(page);
+  const rest = await Promise.all(pages.map((page) => fetchRepoPage(ctx, page)));
+  return [first, ...rest].flatMap((p) => p.repos);
 };
 
 const listBranches = async (ctx, repoId) => {

@@ -22,7 +22,7 @@ const makeFetch = (handlers) => {
           status: r.status ?? 200,
           json: async () => r.json,
           text: async () => (typeof r.text === 'string' ? r.text : JSON.stringify(r.json ?? '')),
-          headers: { get: () => null },
+          headers: { get: (name) => r.headers?.[name.toLowerCase()] ?? null },
         };
       }
     }
@@ -558,13 +558,64 @@ describe('gitlab provider — repo browse + MR + token refresh', () => {
       default_branch: 'main',
     });
     const fetchImpl = makeFetch([
-      ['&page=1&', { json: Array.from({ length: 100 }, (_, i) => project(i)) }],
-      ['&page=2&', { json: [project(100), project(101)] }],
+      [
+        '&page=1&',
+        {
+          json: Array.from({ length: 100 }, (_, i) => project(i)),
+          headers: { 'x-total-pages': '2' },
+        },
+      ],
+      ['&page=2&', { json: [project(100), project(101)], headers: { 'x-total-pages': '2' } }],
     ]);
     const repos = await gl.listRepos({ token: 't', fetchImpl });
     expect(repos).toHaveLength(102);
     expect(repos.at(-1).fullName).toBe('g/p101');
     expect(fetchImpl.calls).toHaveLength(2);
+  });
+
+  it('listRepos makes one call when the first page is short', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '&page=1&',
+        { json: [{ id: 1, name: 'a', path_with_namespace: 'g/a', visibility: 'public' }] },
+      ],
+    ]);
+    const repos = await gl.listRepos({ token: 't', fetchImpl });
+    expect(repos).toEqual([
+      { id: 1, name: 'a', fullName: 'g/a', private: false, defaultBranch: undefined },
+    ]);
+    expect(fetchImpl.calls).toHaveLength(1);
+  });
+
+  it('listRepos fetches the remaining pages in parallel and keeps page order', async () => {
+    const page = (n) =>
+      Array.from({ length: 100 }, (_, i) => ({
+        id: n * 100 + i,
+        name: `p${n}-${i}`,
+        path_with_namespace: `g/p${n}-${i}`,
+        visibility: 'private',
+      }));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetchImpl = async (url) => {
+      const n = Number(new URL(url).searchParams.get('page'));
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Later pages answer first, so order must come from the page number.
+      await new Promise((r) => setTimeout(r, (5 - n) * 5));
+      inFlight -= 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => page(n),
+        headers: { get: (name) => (name.toLowerCase() === 'x-total-pages' ? '4' : null) },
+      };
+    };
+    const repos = await gl.listRepos({ token: 't', fetchImpl });
+    expect(repos).toHaveLength(400);
+    expect(repos[0].fullName).toBe('g/p1-0');
+    expect(repos.at(-1).fullName).toBe('g/p4-99');
+    expect(maxInFlight).toBe(3);
   });
 
   it('listRepos stops at the page cap', async () => {
