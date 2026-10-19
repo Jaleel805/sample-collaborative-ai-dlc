@@ -32,6 +32,7 @@ import {
 } from './aidlc-capabilities.js';
 import { compileStageGraph, compileRules } from './compile.js';
 import { isLoopBackRecommenderStage, loopBackApplies } from './stage-loopback.js';
+import { constructionAutonomyApplies } from './construction-autonomy.js';
 import { stageSkipBlockReason } from './stage-skip.js';
 import {
   FILE_PATH_FLAG,
@@ -39,6 +40,7 @@ import {
   sensorDeclaresDispatcherExitCodes,
   sensorKind,
   sensorPathFlag,
+  validateSensorContractFields,
 } from './v2-sensor-contract.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
@@ -241,6 +243,16 @@ const resolveSensors = (
           err('sensor_missing_command', `sensor "${sid}" has no command`, { stageId, ref: sid }),
         );
       }
+      const contract = validateSensorContractFields({ ...sensor, sensorId: sid });
+      for (const issue of contract.errors) {
+        errors.push(
+          err(issue.code, `sensor "${sid}" ${issue.message}`, {
+            stageId,
+            ref: sid,
+            field: issue.field,
+          }),
+        );
+      }
       const pathFlag =
         sensorKind({ sensorId: sid, runtime: sensor.runtime }) === 'script'
           ? sensorPathFlag(sensor.inputSchema)
@@ -260,6 +272,11 @@ const resolveSensors = (
         // catalog that authors no contract — and a graph sensor, which takes no
         // path at all — keeps its plan byte-identical.
         ...(pathFlag === FILE_PATH_FLAG ? {} : { pathFlag }),
+        // Preserve legacy plan byte identity. The runner applies defaults for
+        // absent fields; authored values still cross this validated boundary.
+        ...Object.fromEntries(
+          Object.entries(contract.fields).filter(([field]) => sensor[field] != null),
+        ),
         // `fire_on` (≥2.7.0) decides which candidate set the runner sweeps, so it
         // has to reach the runtime on the plan — without it the whole plane was
         // inert. Emitted ONLY when authored AND in release mode: an unpinned run
@@ -447,6 +464,12 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
       loopBackApplies({ capabilities }) && isLoopBackRecommenderStage(stage)
         ? 'human-offered'
         : null,
+    // Construction Autonomy Mode shares the loop-back's protocol module, so it is
+    // keyed the same way: the key says only "this release has an autonomy grant to
+    // reproduce". WHETHER a given gate is waived depends on the intent's own
+    // grant and on the stage's position in the plan, both resolved at the gate
+    // (construction-autonomy.js).
+    constructionAutonomy: constructionAutonomyApplies({ capabilities }) ? 'native' : null,
   };
 };
 

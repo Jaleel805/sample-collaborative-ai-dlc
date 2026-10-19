@@ -41,6 +41,16 @@ const SENSOR_RESULT = Object.freeze({
 });
 const SENSOR_RESULTS = Object.freeze(Object.values(SENSOR_RESULT));
 
+// Applicability is independent of a sensor's execution result. A sensor can be
+// definitively irrelevant to a known change set, or its relevance can be
+// unknown because changed-file provenance could not be collected. Only the
+// former may bypass a blocking severity gate.
+const SENSOR_APPLICABILITY = Object.freeze({
+  APPLICABLE: 'APPLICABLE',
+  NOT_APPLICABLE: 'NOT_APPLICABLE',
+  UNKNOWN: 'UNKNOWN',
+});
+
 // Runtime allowlist for the `script` kind — DELIBERATELY narrow. The baseline
 // code sensors ship `runtime: 'bun'`; `sh`/`node` are allowed for shell-form or
 // node deterministic checks. An unknown runtime is rejected (BLOCKED) so a
@@ -216,15 +226,105 @@ const sensorKind = (sensor) => {
   return GRAPH_SENSORS.includes(sensor.sensorId ?? sensor.id) ? 'graph' : 'script';
 };
 
-// Does a result + severity let the stage continue? Only a `blocking` sensor that
-// did not PASS holds the stage. An `advisory` sensor NEVER holds (it records a
-// note and the stage continues). BLOCKED/INCONCLUSIVE are non-PASS but only bite
-// when the sensor is blocking — an advisory tool-unavailable must not wedge a run.
-const severityGate = (result, severity) => {
+// Does a result + severity let the stage continue? A definitively irrelevant
+// sensor never holds a stage. Unknown applicability is deliberately NOT treated
+// as a skip: a blocking sensor still requires PASS after the runner widens its
+// selection to the full checkout. Advisory sensors never hold.
+const severityGate = (result, severity, applicability = SENSOR_APPLICABILITY.APPLICABLE) => {
+  if (applicability === SENSOR_APPLICABILITY.NOT_APPLICABLE) {
+    return { continues: true, held: false };
+  }
   const passed = result === SENSOR_RESULT.PASS;
   if (severity === 'blocking') return { continues: passed, held: !passed };
   return { continues: true, held: false };
 };
+
+// The same code under the name the provenance work introduced.
+const TOOL_UNAVAILABLE_EXIT = SCRIPT_EXIT_TOOL_UNAVAILABLE;
+const SENSOR_VERDICT_MODES = Object.freeze(['stdout-json', 'exit-code']);
+const STDOUT_JSON_SENSORS = Object.freeze(['linter', 'type-check']);
+const SENSOR_SCOPES = Object.freeze(['file', 'project']);
+const PROJECT_SCOPED_SENSORS = Object.freeze(['type-check']);
+const DEFAULT_PROJECT_CONFIG = 'tsconfig.json';
+
+const defaultVerdictMode = (sensor) =>
+  STDOUT_JSON_SENSORS.includes(sensor?.sensorId ?? sensor?.id) ? 'stdout-json' : 'exit-code';
+const defaultScope = (sensor) =>
+  PROJECT_SCOPED_SENSORS.includes(sensor?.sensorId ?? sensor?.id) ? 'project' : 'file';
+
+// A project config is interpreted relative to each detected project root. Keep
+// the accepted representation canonical and platform-independent so joining it
+// to a project root can never select an absolute path or escape that root.
+const validateProjectConfig = (value) => {
+  const invalid = (message) => ({ ok: false, error: message, value: DEFAULT_PROJECT_CONFIG });
+  if (value == null) return { ok: true, value: DEFAULT_PROJECT_CONFIG };
+  if (typeof value !== 'string' || value.length === 0) {
+    return invalid('projectConfig must be a non-empty relative path');
+  }
+  if (
+    value.includes('\\') ||
+    value.includes('\0') ||
+    value.startsWith('/') ||
+    /^[A-Za-z]:/.test(value)
+  ) {
+    return invalid('projectConfig must be a normalized safe relative path');
+  }
+  const segments = value.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+    return invalid('projectConfig must be a normalized safe relative path');
+  }
+  return { ok: true, value };
+};
+
+// Validate the fields shared by plan construction and runtime execution. The
+// returned fields are always safe defaults or validated declarations, even when
+// errors are present, so invalid authored values are never copied into a plan.
+const validateSensorContractFields = (sensor = {}) => {
+  sensor = sensor && typeof sensor === 'object' ? sensor : {};
+  const errors = [];
+  let verdictMode = defaultVerdictMode(sensor);
+  if (sensor.verdictMode != null) {
+    if (SENSOR_VERDICT_MODES.includes(sensor.verdictMode)) verdictMode = sensor.verdictMode;
+    else {
+      errors.push({
+        field: 'verdictMode',
+        code: 'sensor_invalid_verdict_mode',
+        message: `unsupported verdictMode "${sensor.verdictMode}"; allowed: ${SENSOR_VERDICT_MODES.join(', ')}`,
+      });
+    }
+  }
+
+  let scope = defaultScope(sensor);
+  if (sensor.scope != null) {
+    if (SENSOR_SCOPES.includes(sensor.scope)) scope = sensor.scope;
+    else {
+      errors.push({
+        field: 'scope',
+        code: 'sensor_invalid_scope',
+        message: `unsupported scope "${sensor.scope}"; allowed: ${SENSOR_SCOPES.join(', ')}`,
+      });
+    }
+  }
+
+  const projectConfig = validateProjectConfig(sensor.projectConfig);
+  if (!projectConfig.ok) {
+    errors.push({
+      field: 'projectConfig',
+      code: 'sensor_invalid_project_config',
+      message: projectConfig.error,
+    });
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    fields: { verdictMode, scope, projectConfig: projectConfig.value },
+  };
+};
+
+const sensorVerdictMode = (sensor) => validateSensorContractFields(sensor).fields.verdictMode;
+const sensorScope = (sensor) => validateSensorContractFields(sensor).fields.scope;
+const projectConfigFile = (sensor) => validateSensorContractFields(sensor).fields.projectConfig;
 
 // The bound that governs ONE child launch, and which of the three set it.
 //
@@ -270,6 +370,9 @@ const validateScriptSpec = (sensor) => {
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return { ok: false, error: 'sensor timeout must be a positive number of seconds' };
   }
+  const contract = validateSensorContractFields(sensor);
+  if (!contract.ok) return { ok: false, error: contract.errors[0].message };
+
   // The authored budget, clamped by the ceiling. The stage deadline is applied
   // per child launch by the runner, not here: a spec is validated once but a
   // sensor can launch a child per matching file, minutes apart.
@@ -282,8 +385,11 @@ const validateScriptSpec = (sensor) => {
       command: sensor.command,
       pathFlag: sensor.pathFlag ?? sensorPathFlag(sensor.inputSchema),
       timeoutSeconds: seconds,
+      // `scriptTimeoutBound` already applies the MAX_TIMEOUT_SECONDS ceiling
+      // that main clamped inline here.
       timeoutMs: bound.timeoutMs,
       boundedBy: bound.boundedBy,
+      ...contract.fields,
     },
   };
 };
@@ -294,7 +400,7 @@ const validateScriptSpec = (sensor) => {
 // exit code alone: 0 PASS, 2 INCONCLUSIVE, null BLOCKED, else FAIL.
 const resultFromExit = (exitCode) => {
   if (exitCode === 0) return SENSOR_RESULT.PASS;
-  if (exitCode === 2) return SENSOR_RESULT.INCONCLUSIVE;
+  if (exitCode === 2 || exitCode === TOOL_UNAVAILABLE_EXIT) return SENSOR_RESULT.INCONCLUSIVE;
   if (exitCode === null || exitCode === undefined) return SENSOR_RESULT.BLOCKED;
   return SENSOR_RESULT.FAIL;
 };
@@ -630,9 +736,17 @@ const parseBoltDag = (body) => {
 export {
   SENSOR_RESULT,
   SENSOR_RESULTS,
+  SENSOR_APPLICABILITY,
   ALLOWED_SCRIPT_RUNTIMES,
   MAX_TIMEOUT_SECONDS,
   DEFAULT_TIMEOUT_SECONDS,
+  TOOL_UNAVAILABLE_EXIT,
+  SENSOR_VERDICT_MODES,
+  SENSOR_SCOPES,
+  validateSensorContractFields,
+  sensorVerdictMode,
+  sensorScope,
+  projectConfigFile,
   GRAPH_SENSORS,
   FILE_PATH_FLAG,
   OUTPUT_PATH_FLAG,
@@ -656,9 +770,17 @@ export {
 export default {
   SENSOR_RESULT,
   SENSOR_RESULTS,
+  SENSOR_APPLICABILITY,
   ALLOWED_SCRIPT_RUNTIMES,
   MAX_TIMEOUT_SECONDS,
   DEFAULT_TIMEOUT_SECONDS,
+  TOOL_UNAVAILABLE_EXIT,
+  SENSOR_VERDICT_MODES,
+  SENSOR_SCOPES,
+  validateSensorContractFields,
+  sensorVerdictMode,
+  sensorScope,
+  projectConfigFile,
   GRAPH_SENSORS,
   FILE_PATH_FLAG,
   OUTPUT_PATH_FLAG,

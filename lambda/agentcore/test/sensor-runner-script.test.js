@@ -192,15 +192,20 @@ describe.skipIf(!bunAvailable)('script-sensor exit codes (real bun + the real 2.
   }, 120_000);
 
   // Same real script, same real exit, with no authored contract on the sensor:
-  // the D3 record staging produced, kept for unpinned runs and every catalog
-  // that invokes its scripts directly.
-  it('is the undifferentiated FAIL with no reason when the catalog authors no contract', async () => {
+  // the default exit mapping, kept for unpinned runs and every catalog that
+  // invokes its scripts directly. It carries no sensor-level reason and none of
+  // the dispatcher contract's reading of the exit.
+  it('is the default mapping with no reason when the catalog authors no contract', async () => {
     const [verdict] = await runner().runStageSensors({
       sensors: [linter()],
       stageId: 'functional-design',
     });
-    expect(verdict).toMatchObject({ kind: 'script', result: 'FAIL', held: false });
+    expect(verdict).toMatchObject({ kind: 'script', result: 'INCONCLUSIVE', held: false });
     expect(verdict.detail).not.toHaveProperty('reason');
-    expect(verdict.detail.files[0]).toMatchObject({ result: 'FAIL', detail: null });
+    expect(verdict.detail.harnessFailures[0]).toMatchObject({
+      reason: 'tool-unavailable',
+      exitCode: 127,
+    });
+    expect(verdict.detail.harnessFailures[0]).not.toHaveProperty('toolUnavailable');
   }, 120_000);
 });

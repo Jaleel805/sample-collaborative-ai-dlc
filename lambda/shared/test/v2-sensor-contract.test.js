@@ -11,6 +11,10 @@ import {
   resultFromExit,
   resultFromDispatcherExit,
   dispatcherExitReason,
+  TOOL_UNAVAILABLE_EXIT,
+  sensorVerdictMode,
+  sensorScope,
+  projectConfigFile,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -97,6 +101,42 @@ describe('validateScriptSpec', () => {
     });
     expect(r.spec.pathFlag).toBe('--output-path');
   });
+
+  it.each([
+    ['verdictMode', 'yaml', /unsupported verdictMode/],
+    ['scope', 'workspace', /unsupported scope/],
+  ])('rejects an unsupported %s before a sensor can run', (field, value, error) => {
+    const result = validateScriptSpec({
+      sensorId: 'custom-checker',
+      runtime: 'bun',
+      command: 'bun checker.ts',
+      timeoutSeconds: 5,
+      [field]: value,
+    });
+
+    expect(result).toEqual({ ok: false, error: expect.stringMatching(error) });
+  });
+
+  it.each([
+    ['/etc/tsconfig.json', 'POSIX absolute path'],
+    ['C:\\secrets\\tsconfig.json', 'Windows absolute path'],
+    ['../tsconfig.json', 'parent traversal'],
+    ['config/../../tsconfig.json', 'nested parent traversal'],
+  ])('rejects unsafe projectConfig %s (%s)', (projectConfig) => {
+    const result = validateScriptSpec({
+      sensorId: 'type-check',
+      runtime: 'bun',
+      command: 'bun type-check.ts',
+      timeoutSeconds: 5,
+      scope: 'project',
+      projectConfig,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'projectConfig must be a normalized safe relative path',
+    });
+  });
 });
 
 // The bound one child launch gets. The three states of the remaining stage
@@ -164,6 +204,26 @@ describe('resultFromExit', () => {
     expect(resultFromExit(2)).toBe(SENSOR_RESULT.INCONCLUSIVE);
     expect(resultFromExit(1)).toBe(SENSOR_RESULT.FAIL);
     expect(resultFromExit(null)).toBe(SENSOR_RESULT.BLOCKED);
+  });
+});
+
+describe('sensor script metadata', () => {
+  it('classifies the reserved tool-unavailable exit as INCONCLUSIVE', () => {
+    expect(TOOL_UNAVAILABLE_EXIT).toBe(127);
+    expect(resultFromExit(TOOL_UNAVAILABLE_EXIT)).toBe(SENSOR_RESULT.INCONCLUSIVE);
+  });
+
+  it('uses explicit declarations and backward-compatible upstream defaults', () => {
+    expect(sensorVerdictMode({ sensorId: 'custom', verdictMode: 'stdout-json' })).toBe(
+      'stdout-json',
+    );
+    expect(sensorVerdictMode({ sensorId: 'linter' })).toBe('stdout-json');
+    expect(sensorVerdictMode({ sensorId: 'custom' })).toBe('exit-code');
+    expect(sensorScope({ sensorId: 'type-check' })).toBe('project');
+    expect(sensorScope({ sensorId: 'linter' })).toBe('file');
+    expect(sensorScope({ sensorId: 'linter', scope: 'project' })).toBe('project');
+    expect(projectConfigFile({ projectConfig: 'jsconfig.json' })).toBe('jsconfig.json');
+    expect(projectConfigFile({})).toBe('tsconfig.json');
   });
 });
 
