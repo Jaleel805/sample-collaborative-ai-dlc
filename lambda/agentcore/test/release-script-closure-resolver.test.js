@@ -14,8 +14,12 @@
 //   - a user-tenant SENSOR overlay, resolved through the production library
 //     resolver and plan builder, is not asked for a methodology closure at all.
 
+import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mockClient } from 'aws-sdk-client-mock';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -34,7 +38,7 @@ import {
   createReleaseScriptClosureReader,
   releaseOwnedSensorPredicate,
 } from '../release-script-closure.js';
-import { isReleaseDependencyError } from '../sensor-runner.js';
+import { createSensorRunner, isReleaseDependencyError } from '../sensor-runner.js';
 
 const BUCKET = 'artifacts-test';
 const TABLE = 'blocks-test';
@@ -46,6 +50,7 @@ const ddbMock = mockClient(DynamoDBDocumentClient);
 const s3 = new S3Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const store = new Map();
+const getFailures = new Map();
 
 const noSuchKey = () => {
   const error = new Error('The specified key does not exist.');
@@ -53,6 +58,56 @@ const noSuchKey = () => {
   error.$metadata = { httpStatusCode: 404 };
   return error;
 };
+
+// The storage failures that are NOT a missing key. The resolver converts only
+// `NoSuchKey` into a typed release error; these reject with whatever the SDK or
+// the body stream raised, which is what used to escape the closure reader.
+const accessDenied = () => {
+  const error = new Error('Access Denied');
+  error.name = 'AccessDenied';
+  error.$metadata = { httpStatusCode: 403 };
+  return error;
+};
+
+const timeoutError = () => {
+  const error = new Error('socket timed out');
+  error.name = 'TimeoutError';
+  return error;
+};
+
+const bodyReadFailure = () => {
+  const error = new Error('aborted mid-stream');
+  error.name = 'Error';
+  return error;
+};
+
+// The three ways a published object the reader needs can fail to come back:
+// refused, never arrived, and arrived but died while being read. Each is applied
+// to a specific key through `getFailures`.
+const READ_FAILURES = [
+  [
+    'a permissions failure',
+    () => {
+      throw accessDenied();
+    },
+  ],
+  [
+    'a transport failure',
+    () => {
+      throw timeoutError();
+    },
+  ],
+  [
+    'a body read failure',
+    () => ({
+      Body: {
+        transformToString: async () => {
+          throw bodyReadFailure();
+        },
+      },
+    }),
+  ],
+];
 
 const fixture = JSON.parse(
   readFileSync(
@@ -110,15 +165,55 @@ const readerFor = (sensorsById, { resolveRuntimeFile } = {}) =>
     ...(resolveRuntimeFile ? { resolveRuntimeFile } : {}),
   });
 
+const TYPE_CHECK_SENSOR = Object.freeze({
+  sensorId: 'type-check',
+  severity: 'advisory',
+  runtime: 'bun',
+  command: 'bun aidlc-sensor-type-check.ts',
+  matches: '**/*.ts',
+  timeoutSeconds: 5,
+});
+
+let workspace = null;
+
+const recordingSpawn = (launches) => (file, args) => {
+  launches.push({ file, args });
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+  setTimeout(() => {
+    child.stdout.emit('data', Buffer.from('{"pass":true}'));
+    child.emit('close', 0);
+  }, 0);
+  return child;
+};
+
+// The production sensor runner driving the production closure reader: the
+// verdict is what a stage actually records, and `launches` collects every
+// interpreter the runner would have started.
+const runAdvisoryTypeCheck = async (launches) => {
+  const runner = createSensorRunner({
+    graph: null,
+    loadBlockScript: async () => typeCheckScript,
+    workspaceDir: workspace,
+    spawnFn: recordingSpawn(launches),
+    loadScriptClosure: readerFor({ 'type-check': { tenantId: 'SYSTEM' } }),
+  });
+  return runner.runStageSensors({ sensors: [TYPE_CHECK_SENSOR], stageId: 'code-generation' });
+};
+
 beforeEach(async () => {
   s3Mock.reset();
   ddbMock.reset();
   store.clear();
+  getFailures.clear();
   s3Mock.on(PutObjectCommand).callsFake((input) => {
     store.set(input.Key, String(input.Body));
     return {};
   });
   s3Mock.on(GetObjectCommand).callsFake((input) => {
+    if (getFailures.has(input.Key)) return getFailures.get(input.Key)();
     if (!store.has(input.Key)) throw noSuchKey();
     return { Body: { transformToString: async () => store.get(input.Key) } };
   });
@@ -131,6 +226,13 @@ beforeEach(async () => {
   // immutable), so every test here starts from cold.
   __test.releaseClosureCache.clear();
   await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+  workspace = await mkdtemp(path.join(tmpdir(), 'release-closure-'));
+  await mkdir(path.join(workspace, 'src'), { recursive: true });
+  await writeFile(path.join(workspace, 'src', 'a.ts'), 'export const x = 1;');
+});
+
+afterEach(async () => {
+  await rm(workspace, { recursive: true, force: true });
 });
 
 describe('the reader against the production resolver', () => {
@@ -163,6 +265,113 @@ describe('the reader against the production resolver', () => {
     const error = await reader('type-check', typeCheckScript).catch((caught) => caught);
     expect(error).toMatchObject({ code: 'release_closure_mismatch' });
     expect(isReleaseDependencyError(error)).toBe(true);
+  });
+});
+
+// A pinned import whose object exists but cannot be READ. The resolver only
+// converts a missing key into a typed release error, so a permissions failure, a
+// transport failure or a body stream that dies mid-read used to escape the
+// reader raw. The sensor runner recognizes only release-dependency errors as
+// fatal, so an advisory sensor whose pinned import could not be read was
+// recorded BLOCKED without holding the stage — the stage continued on a check
+// that never ran, while the same sensor with a MISSING import correctly held it.
+describe('a pinned import the release publishes but storage cannot read', () => {
+  const manifestEntryForLib = () =>
+    bundle.manifest.runtimeFiles.find((file) => file.path === AIDLC_LIB);
+
+  describe.each(READ_FAILURES)('%s', (_label, onGet) => {
+    it('is a release dependency error naming the unreadable import', async () => {
+      getFailures.set(manifestEntryForLib().key, onGet);
+      const reader = readerFor({ 'type-check': { tenantId: 'SYSTEM' } });
+
+      const error = await reader('type-check', typeCheckScript).catch((caught) => caught);
+
+      expect(error).toMatchObject({
+        name: 'ReleaseResolverError',
+        code: 'release_object_unreadable',
+        details: { repoPath: AIDLC_LIB },
+      });
+      expect(error.message).toContain(AIDLC_LIB);
+      expect(isReleaseDependencyError(error)).toBe(true);
+    });
+
+    // The entry script loads fine, so the sensor reaches materialization: the
+    // defect is that the failure is in a dependency, not in the script itself.
+    it('launches no script and holds the stage even for an advisory sensor', async () => {
+      getFailures.set(manifestEntryForLib().key, onGet);
+      const launches = [];
+
+      const verdicts = await runAdvisoryTypeCheck(launches);
+
+      expect(launches).toEqual([]);
+      expect(verdicts[0]).toMatchObject({
+        severity: 'advisory',
+        result: 'BLOCKED',
+        held: true,
+        detail: {
+          code: 'release_object_unreadable',
+          releaseIntegrityFailure: true,
+          details: { repoPath: AIDLC_LIB },
+        },
+      });
+      await expect(readdir(path.join(workspace, '.aidlc', 'sensors'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+  });
+
+  it('keeps an import storage never published on its own code', async () => {
+    store.delete(manifestEntryForLib().key);
+    const launches = [];
+
+    const verdicts = await runAdvisoryTypeCheck(launches);
+
+    expect(launches).toEqual([]);
+    expect(verdicts[0]).toMatchObject({
+      result: 'BLOCKED',
+      held: true,
+      detail: { code: 'runtime_file_missing', releaseIntegrityFailure: true },
+    });
+  });
+});
+
+// The other half of the same defect: the closure the reader needs BEFORE it can
+// resolve a single import. `loadReleaseClosure` rethrows raw storage errors and
+// JSON parse failures, so an unreadable manifest escaped the reader exactly like
+// an unreadable import did.
+describe('a release closure storage cannot read', () => {
+  describe.each(READ_FAILURES)('%s', (_label, onGet) => {
+    it('is a release dependency error naming the sensor entry', async () => {
+      getFailures.set(pin.manifestKey, onGet);
+      const reader = readerFor({ 'type-check': { tenantId: 'SYSTEM' } });
+
+      const error = await reader('type-check', typeCheckScript).catch((caught) => caught);
+
+      expect(error).toMatchObject({
+        name: 'ReleaseResolverError',
+        code: 'release_object_unreadable',
+      });
+      expect(error.details.repoPath).toBeUndefined();
+      expect(isReleaseDependencyError(error)).toBe(true);
+    });
+
+    it('launches no script and holds the stage even for an advisory sensor', async () => {
+      getFailures.set(pin.manifestKey, onGet);
+      const launches = [];
+
+      const verdicts = await runAdvisoryTypeCheck(launches);
+
+      expect(launches).toEqual([]);
+      expect(verdicts[0]).toMatchObject({
+        severity: 'advisory',
+        result: 'BLOCKED',
+        held: true,
+        detail: { code: 'release_object_unreadable', releaseIntegrityFailure: true },
+      });
+      await expect(readdir(path.join(workspace, '.aidlc', 'sensors'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
   });
 });
 

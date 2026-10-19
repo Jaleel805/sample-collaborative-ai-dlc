@@ -25,6 +25,7 @@ import {
   importSpecifiers,
   resolveRelativeImport,
 } from '../shared/script-closure.js';
+import { isReleaseDependencyError } from './sensor-runner.js';
 
 const artifactsBucket = () => process.env.ARTIFACTS_BUCKET;
 
@@ -80,6 +81,36 @@ export const resolveScriptClosure = async ({ entryPath, entryContent, publishes,
 export const releaseOwnedSensorPredicate = (sensorsById) => (sensorId) =>
   (sensorsById?.[sensorId]?.tenantId ?? SYSTEM_TENANT) === SYSTEM_TENANT;
 
+// Re-raise a raw closure or object read failure as a release dependency error.
+//
+// The resolver converts only a MISSING key into a typed error; a permissions
+// failure, a transport error, or a body stream that dies mid-read rejects with
+// whatever the SDK raised. Those names are not release dependency errors, so the
+// runner's generic handler recorded the sensor BLOCKED without the fatal flag —
+// an advisory pinned sensor whose script never ran let the stage continue, while
+// the same sensor with an absent dependency correctly held it. A pinned
+// dependency that cannot be READ is exactly as unverifiable as one that is
+// absent, so it gets `release_object_unreadable`, the code `block-loader.js`
+// already uses for an unreadable release object. Errors the runner already
+// recognizes pass through untouched, so `runtime_file_missing` and
+// `release_closure_mismatch` still reach the verdict as themselves.
+const asReleaseDependencyFailure = (error, { entryPath, repoPath = null }) => {
+  if (isReleaseDependencyError(error)) return error;
+  const subject = repoPath ? `pinned import ${repoPath}` : 'its release closure';
+  return new ReleaseResolverError(
+    'release_object_unreadable',
+    `release-script-closure: ${entryPath} could not read ${subject}`,
+    {
+      cause: error,
+      details: {
+        entryPath,
+        ...(repoPath ? { repoPath } : {}),
+        reason: error?.name ?? 'Error',
+      },
+    },
+  );
+};
+
 // The runtime's reader: resolves a pinned sensor's import closure out of the
 // intent's release closure. Returns [] in legacy mode, where a sensor script is
 // a single self-contained object and there is no closure to read.
@@ -103,13 +134,24 @@ export const createReleaseScriptClosureReader = ({
     // read: that keeps every release whose sensor scripts import nothing on
     // exactly the object reads it performs today.
     if (!importSpecifiers(entryContent).some((specifier) => specifier.startsWith('.'))) return [];
-    const closure = await loadReleaseClosure({ s3, bucket: bucket(), methodologyRelease });
+    const entryPath = sensorScriptPath(sensorId);
+    let closure;
+    try {
+      closure = await loadReleaseClosure({ s3, bucket: bucket(), methodologyRelease });
+    } catch (error) {
+      throw asReleaseDependencyFailure(error, { entryPath });
+    }
     return resolveScriptClosure({
-      entryPath: sensorScriptPath(sensorId),
+      entryPath,
       entryContent,
       publishes: (repoPath) => closure.runtimeFiles?.has(repoPath) ?? false,
-      read: async (repoPath) =>
-        (await resolveRuntimeFile({ s3, bucket: bucket(), closure, repoPath })).content,
+      read: async (repoPath) => {
+        try {
+          return (await resolveRuntimeFile({ s3, bucket: bucket(), closure, repoPath })).content;
+        } catch (error) {
+          throw asReleaseDependencyFailure(error, { entryPath, repoPath });
+        }
+      },
     });
   };
 };
