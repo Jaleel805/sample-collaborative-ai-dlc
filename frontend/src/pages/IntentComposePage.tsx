@@ -21,6 +21,7 @@ import { AidlcSettingsPanel } from '@/components/AidlcSettingsPanel';
 import {
   aidlcSettingsFromComposeProposal,
   AIDLC_SETTING_LABELS,
+  normalizeAidlcSettings,
   type AidlcSettingValue,
 } from '@/lib/aidlcSettings';
 import { StageGridEditor } from '@/components/intent/StageGridEditor';
@@ -519,7 +520,21 @@ function IntentComposePageContent() {
     // those windows dropped every value the job had already validated.
     const catalogSettingsAware = settingsAware || settingsScope !== null;
     const proposed = catalogSettingsAware ? aidlcSettingsFromComposeProposal(proposal) : {};
-    const aidlcSettings = Object.keys(proposed).length > 0 ? proposed : null;
+    // A proposal for the selection already in force changes no selection, so no
+    // preview re-runs to prune it. Normalize it here against the authored map
+    // of that selection, so a value equal to its default is not kept as a
+    // choice that would become an override of the next scope's own default.
+    const selectionUnchanged =
+      proposal.mode === 'matched'
+        ? proposal.scope === scope && !draft.composedGrid
+        : proposal.scope === scope &&
+          JSON.stringify(proposal.grid ?? null) === JSON.stringify(draft.composedGrid ?? null);
+    const aidlcSettings =
+      selectionUnchanged && authoredSettings
+        ? normalizeAidlcSettings({ settings: proposed, authored: authoredSettings }).value
+        : Object.keys(proposed).length > 0
+          ? proposed
+          : null;
     if (proposal.mode === 'matched') {
       draft.applyComposedSelection({ scope: proposal.scope, aidlcSettings });
       return;

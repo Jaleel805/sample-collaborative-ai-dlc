@@ -1039,6 +1039,48 @@ describe('IntentComposePage — applying a composed plan with its settings', () 
     });
   });
 
+  // Applying a proposal for the scope already selected changes no selection, so
+  // no preview re-runs to prune it: a proposed value equal to that scope's
+  // default would stay in the shared document as a choice and become a real
+  // override of the next scope's own default.
+  it('drops proposed values equal to the current scope default when the selection is unchanged', async () => {
+    const user = userEvent.setup();
+    withProposal(
+      {
+        mode: 'matched',
+        scope: 'feature',
+        guardPolicy: 'off',
+        scopeSettings: { collaborators: 'on' },
+      },
+      { settingsScope: 'feature' },
+    );
+
+    renderPage();
+    await screen.findByTestId('proposal-apply');
+    await waitFor(() => expect(executionPreview).toHaveBeenCalled());
+    await user.click(screen.getByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'feature',
+      aidlcSettings: { collaborators: 'on' },
+    });
+  });
+
+  it('stores nothing when every proposed value equals the current scope default', async () => {
+    const user = userEvent.setup();
+    withProposal(
+      { mode: 'matched', scope: 'feature', guardPolicy: 'off' },
+      { settingsScope: 'feature' },
+    );
+
+    renderPage();
+    await screen.findByTestId('proposal-apply');
+    await waitFor(() => expect(executionPreview).toHaveBeenCalled());
+    await user.click(screen.getByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({ scope: 'feature', aidlcSettings: null });
+  });
+
   it('sends no settings for a proposal that proposed none', async () => {
     const user = userEvent.setup();
     withProposal({ mode: 'matched', scope: 'bugfix' });
