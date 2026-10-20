@@ -331,7 +331,12 @@ const buildComposePrompt = ({
   const cut = (section) => {
     const limit = share.get(section);
     if (limit === undefined || section.text.length <= limit) return section.text;
-    return `${section.text.slice(0, Math.max(0, limit - section.marker.length - 1))}\n${section.marker}`;
+    // A cut section never takes more than its share, even when the share is
+    // smaller than its marker: it keeps the marker alone if that fits, and
+    // gives way entirely otherwise.
+    const keep = limit - section.marker.length - 1;
+    if (keep > 0) return `${section.text.slice(0, keep)}\n${section.marker}`;
+    return section.marker.length <= limit ? section.marker : '';
   };
   const budgeted = joinSections(sections.map(cut));
   if (budgeted.length <= CONTEXT_LIMIT) return budgeted;

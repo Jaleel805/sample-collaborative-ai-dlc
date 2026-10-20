@@ -73,6 +73,25 @@ describe.each(RELEASES)('compose prompt budget — %s stock grounding', (profile
   });
 });
 
+// The space left for the bounded sections can be smaller than their markers.
+// A cut section must then give way entirely rather than overflow its share,
+// or the prompt would fall to the last resort and lose the end of a grounding
+// that fits on its own.
+describe('compose prompt budget — no room left for the bounded sections', () => {
+  const build = (grounding, persona, reportExcerpt) =>
+    buildComposePrompt({ mode: 'report', persona, grounding, intentPrompt: 'I', reportExcerpt });
+
+  it.each([0, 40, 100, 147])('keeps the grounding whole with %i characters to spare', (room) => {
+    const probe = 'G'.repeat(1000);
+    const fixed = build(probe, 'A', 'B').length - 'A'.length - 'Report excerpt:\nB'.length;
+    const grounding = 'G'.repeat(1000 + COMPOSE_CONTEXT_LIMIT - fixed - room);
+    const prompt = build(grounding, 'P'.repeat(40000), 'R'.repeat(MAX_REPORT_EXCERPT));
+
+    expect(prompt).toContain(grounding);
+    expect(prompt.length).toBeLessThanOrEqual(COMPOSE_CONTEXT_LIMIT);
+  });
+});
+
 // An unpinned or 2.3.3 intent grounds on a release that authors no per-intent
 // setting and whose composer names no engine command, and its whole prompt fits.
 // That prompt is joined in section order and nothing is bounded — byte for byte
