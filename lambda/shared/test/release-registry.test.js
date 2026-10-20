@@ -18,6 +18,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { UNMAPPED_FIELD_GAP_VALUE } from '../aidlc-capabilities.js';
 import { customProfile, filesFromCompatibilityFixture } from '../aidlc-compatibility.js';
 import {
   AIDLC_RELEASE_IMPORTER_REVISION,
@@ -2299,6 +2300,102 @@ describe('a 2.9.0 whose developer persona carries the engine command', () => {
   });
 });
 
+// An execution-relevant authored field no adapter consumes is how a future
+// release would silently lose a setting: the closure already records its name,
+// so promotion must name it as a blocker rather than leave it to certification.
+describe('a release authoring an execution-relevant field no adapter consumes', () => {
+  const SCOPE_PATH = 'core/scopes/aidlc-bugfix.md';
+  const FUTURE_FIELD = { blockType: 'SCOPE', field: 'future_switch', value: 'unmapped' };
+
+  const withFutureField = (files) => {
+    expect(files.has(SCOPE_PATH), SCOPE_PATH).toBe(true);
+    files.set(SCOPE_PATH, files.get(SCOPE_PATH).replace('---\n', '---\nfuture_switch: later\n'));
+    return files;
+  };
+
+  it.each(['selectable', 'certified'])(
+    'refuses %s promotion and names the field',
+    async (state) => {
+      installFakes();
+      const bundle = buildReleaseBundle({
+        profileId: CANDIDATE_PROFILE,
+        files: withFutureField(filesWithInvokeLines(CANDIDATE_PROFILE)),
+      });
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+      const { release } = await registerRelease(registerArgs(CANDIDATE_PROFILE));
+
+      expect(release.unhonouredValues).toContainEqual(FUTURE_FIELD);
+      await expect(
+        updateRelease({
+          ...registryArgs(),
+          s3,
+          bucket: BUCKET,
+          releaseId: release.releaseId,
+          expectedRevision: release.revision,
+          patch: { supportState: state },
+          actor: 'admin-1',
+        }),
+      ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+    },
+  );
+
+  // Fork promotion goes through the same guard, so a fork that authors an
+  // unknown field is held exactly as an official release would be.
+  it('holds a fork authoring the same field', async () => {
+    installFakes();
+    const FORK_SHA = 'abcdef0123456789abcdef0123456789abcdef01';
+    const profile = customProfile({
+      repository: 'acme/aidlc-own',
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+    });
+    const bundle = buildReleaseBundle({
+      profile,
+      files: withFutureField(filesWithInvokeLines(CANDIDATE_PROFILE)),
+    });
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+    const { release } = await registerCustomRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      repository: 'acme/aidlc-own',
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+      actor: 'admin-1',
+    });
+
+    expect(release.unhonouredValues).toContainEqual(FUTURE_FIELD);
+    await expect(
+      updateRelease({
+        ...registryArgs(),
+        s3,
+        bucket: BUCKET,
+        releaseId: release.releaseId,
+        expectedRevision: release.revision,
+        patch: { supportState: 'selectable' },
+        actor: 'admin-1',
+      }),
+    ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+  });
+  // The regression guard for the blocker itself: every release this build
+  // already promotes authors no such field, so none of them becomes blocked.
+  it.each(Object.keys(AIDLC_COMPATIBILITY_PROFILES))(
+    'leaves the allowlisted %s with no unmapped-field blocker',
+    async (profileId) => {
+      installFakes();
+      const bundle = buildReleaseBundle({ profileId, files: filesWithInvokeLines(profileId) });
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+
+      const { release } = await registerRelease(registerArgs(profileId));
+
+      expect(bundle.manifest.compatibility.executionRelevantUnmappedFields).toEqual([]);
+      expect(
+        release.unhonouredValues.filter((gap) => gap.value === UNMAPPED_FIELD_GAP_VALUE),
+      ).toEqual([]);
+    },
+  );
+});
+
 describe('promotion of a record registered before protocol evidence existed', () => {
   // A record imported by an earlier build stored only its frontmatter gaps; the
   // build-and-test loop-back is a protocol the closure ships, not an authored
@@ -2333,7 +2430,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 4,
+      fidelityEvidenceRevision: 5,
     });
   });
 
@@ -2341,7 +2438,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
     await registerRelease(registerArgs(CANDIDATE_PROFILE));
 
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 4,
+      fidelityEvidenceRevision: 5,
     });
   });
 
@@ -2397,6 +2494,212 @@ describe('promotion of a record whose evidence read the engine sources', () => {
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(key).fidelityGaps).not.toContainEqual(row.fidelityGaps[0]);
+  });
+});
+
+// An `unmapped` gap says the importer of that closure stored NO value for the
+// field. Adding a runtime handler later cannot recover what was dropped, so the
+// blocker must survive a build that can handle the field — only a re-import
+// under the newer revision may clear it.
+describe('promotion of a closure whose importer never stored the field', () => {
+  const UNMAPPED_GAPS = Object.freeze([
+    { blockType: 'SCOPE', field: 'guard_policy', value: UNMAPPED_FIELD_GAP_VALUE },
+    { blockType: 'SCOPE', field: 'plan_approval', value: UNMAPPED_FIELD_GAP_VALUE },
+  ]);
+
+  // The row an earlier importer revision left behind: its catalog has no value
+  // for either field, and its gap list is current evidence for THAT closure.
+  const atTheOlderImporterRevision = async () => {
+    installFakes();
+    const bundle = buildReleaseBundle({
+      profileId: CANDIDATE_PROFILE,
+      files: filesWithInvokeLines(CANDIDATE_PROFILE),
+    });
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+    await registerRelease(registerArgs(CANDIDATE_PROFILE));
+    const key = keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META');
+    // The evidence revision stays the one this build just wrote, so the stored
+    // list is current evidence and the guard reads it rather than recomputing:
+    // the question under test is what the registry does with an `unmapped`
+    // value it now has an entry for.
+    const row = {
+      ...rows.get(key),
+      importerRevision: 2,
+      fidelityGaps: [...UNMAPPED_GAPS],
+    };
+    rows.set(key, row);
+    return row;
+  };
+
+  it.each(['selectable', 'certified'])('refuses %s promotion', async (state) => {
+    const row = await atTheOlderImporterRevision();
+
+    await expect(
+      updateRelease({
+        ...registryArgs(),
+        s3,
+        bucket: BUCKET,
+        releaseId: CANDIDATE_RELEASE_ID,
+        expectedRevision: row.revision,
+        patch: { supportState: state },
+        actor: 'admin-1',
+      }),
+    ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+  });
+
+  it('keeps naming both fields when an admin lists it', async () => {
+    await atTheOlderImporterRevision();
+
+    const releases = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
+
+    const listed = releases.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
+    for (const gap of UNMAPPED_GAPS) {
+      expect(listed.unhonouredValues).toContainEqual(gap);
+    }
+    expect(listed.importerRevision).toBe(2);
+  });
+});
+
+// Mapping a new authored field removes its `unmapped` blocker, and nothing else
+// makes the setting work, so each of the four carries a classification from the
+// moment it becomes mapped and holds promotion until its handler ships. This PR
+// resolves the last of them, so the whole set promotes — and an illegal value is
+// still refused, which is what keeps these promotions a statement about the
+// VALUES rather than about the field names.
+describe('fork promotion of a release authoring the 2.11 scope settings', () => {
+  const SCOPE_PATH = 'core/scopes/aidlc-classic.md';
+  const SETTINGS = [
+    'guard_policy: strict',
+    'plan_approval: off',
+    'collaborators: off',
+    'existing_code: true',
+  ];
+  const FORK_REPOSITORY = 'acme/aidlc-settings';
+  const FORK_SHA = 'bcdef0123456789abcdef0123456789abcdef012';
+
+  const withSettings = (files, lines) => {
+    expect(files.has(SCOPE_PATH), SCOPE_PATH).toBe(true);
+    files.set(SCOPE_PATH, files.get(SCOPE_PATH).replace('---\n', `---\n${lines.join('\n')}\n`));
+    return files;
+  };
+
+  const forkBundle = (lines) =>
+    buildReleaseBundle({
+      profile: customProfile({
+        repository: FORK_REPOSITORY,
+        sha: FORK_SHA,
+        baseProfileId: CANDIDATE_PROFILE,
+      }),
+      files: withSettings(filesWithInvokeLines(CANDIDATE_PROFILE), lines),
+    });
+
+  const registerFork = async (lines) => {
+    installFakes();
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle: forkBundle(lines) });
+    return registerCustomRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      repository: FORK_REPOSITORY,
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+      actor: 'admin-1',
+    });
+  };
+
+  const promoteFork = (release, state) =>
+    updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId: release.releaseId,
+      expectedRevision: release.revision,
+      patch: { supportState: state },
+      actor: 'admin-1',
+    });
+
+  it.each(SETTINGS)('promotes a fork authoring %s alone', async (line) => {
+    const { release } = await registerFork([line]);
+
+    // The field is mapped, so its `unmapped` blocker is gone — and it is
+    // handled, which is why nothing replaced it.
+    expect(release.unhonouredValues).toEqual([]);
+    await expect(promoteFork(release, 'selectable')).resolves.toMatchObject({
+      supportState: 'selectable',
+    });
+  });
+
+  it.each(['selectable', 'certified'])(
+    'promotes a fork authoring all of them to %s',
+    async (state) => {
+      const { release } = await registerFork(SETTINGS);
+
+      expect(release.unhonouredValues).toEqual([]);
+      await expect(promoteFork(release, state)).resolves.toMatchObject({ supportState: state });
+    },
+  );
+
+  it.each(['guard_policy: paranoid', 'plan_approval: maybe', 'existing_code: "true"'])(
+    'refuses to import a fork authoring %s',
+    (line) => {
+      installFakes();
+
+      expect(() => forkBundle([line])).toThrow(
+        expect.objectContaining({ code: 'release_import_rejected' }),
+      );
+    },
+  );
+});
+
+// A stored list carrying a NUMERIC revision this build has moved past is the
+// other stale shape, and the one an upgrade actually produces: the previous
+// build wrote `fidelityEvidenceRevision: 4` with evidence that never judged an
+// unmapped execution-relevant field, so the row looks complete while holding a
+// verdict this build would not reach. The revision — not the presence of a list
+// — is what has to decide whether the closure is re-read.
+describe('promotion of a record whose evidence predates the unmapped-field blocker', () => {
+  const STALE_GAP = Object.freeze({
+    blockType: 'BODY',
+    field: '{{INVOKE}}',
+    value: 'engine state practices-event',
+    annexed: false,
+  });
+
+  const registeredAtTheOlderRevision = async () => {
+    await registerRelease(registerArgs(CANDIDATE_PROFILE));
+    const key = keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META');
+    const row = { ...rows.get(key), fidelityGaps: [STALE_GAP], fidelityEvidenceRevision: 4 };
+    rows.set(key, row);
+    return { key, row };
+  };
+
+  it('re-evaluates the closure instead of trusting that list', async () => {
+    const { key, row } = await registeredAtTheOlderRevision();
+
+    const promoted = await updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId: CANDIDATE_RELEASE_ID,
+      expectedRevision: row.revision,
+      patch: { supportState: 'selectable' },
+      actor: 'admin-1',
+    });
+
+    expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
+    expect(rows.get(key).fidelityGaps).not.toContainEqual(STALE_GAP);
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 5 });
+  });
+
+  it('reports the recomputed answer when an admin lists it', async () => {
+    const { key } = await registeredAtTheOlderRevision();
+
+    const releases = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
+
+    const listed = releases.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
+    expect(listed.unhonouredValues).toEqual([]);
+    expect(listed.fidelityGaps).not.toContainEqual(STALE_GAP);
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 5 });
   });
 });
 
@@ -2540,7 +2843,7 @@ describe('admin listing of a record registered before protocol evidence existed'
     const second = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
 
     const listed = first.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
-    expect(cached.fidelityEvidenceRevision).toBe(4);
+    expect(cached.fidelityEvidenceRevision).toBe(5);
     expect(cached.fidelityGaps).toEqual(listed.fidelityGaps);
     expect(cached.fidelityGaps).not.toEqual(legacy.fidelityGaps);
     // Evidence is derived from an immutable closure, never a decision, so the
