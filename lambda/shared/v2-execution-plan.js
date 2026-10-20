@@ -24,7 +24,9 @@ import { createHash } from 'node:crypto';
 import {
   POLICY_ENUMS,
   SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
   defaultWhenAbsent,
   planApprovalApplies,
   resolveCapabilities,
@@ -42,11 +44,14 @@ import {
   sensorPathFlag,
   validateSensorContractFields,
 } from './v2-sensor-contract.js';
+import { SYSTEM_TENANT } from './tenant.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
 // capability cannot be declared handled without the code that handles it.
 export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
+  'policy.guard-policy.off@v1',
+  'policy.plan-approval.switch@v1',
   'policy.review-cap@v1',
   'policy.sensors@v1',
   'policy.summary-confirmation.off@v1',
@@ -59,6 +64,47 @@ export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
 // it requires real concurrent sessions.
 const RUNNABLE_MODES = ['inline', 'subagent'];
 const RELEASE_RUNNABLE_MODES = [...RUNNABLE_MODES, 'pipeline', 'mob'];
+
+// The stage modes that can get a real session per support persona: `pipeline`
+// and `mob` always, a `subagent` only when it declares supports. Exported
+// because the ensemble runner's topology gate and the plan's record of what the
+// collaborators switch withdrew must be the SAME mode set — otherwise the plan
+// would claim a downgrade on a stage that never had support sessions, or stay
+// silent about one that did.
+export const SUPPORT_SESSION_MODES = Object.freeze(['pipeline', 'mob', 'subagent']);
+
+// The closure's protocol file distinguishes a delegated single-session subagent
+// from hub-and-spoke support sessions without relying on a release version.
+export const ENSEMBLE_PROTOCOL_FILE = 'core/aidlc-common/protocols/stage-protocol-ensemble.md';
+
+const hasRuntimeFile = (library, path) => {
+  const paths = library?.runtimeFilePaths;
+  // A library that carries no runtime-file list cannot say; only a release
+  // closure is ever resolved here, and the resolver always stamps the list.
+  if (paths == null) return true;
+  return Array.isArray(paths)
+    ? paths.includes(path)
+    : typeof paths.has === 'function' && paths.has(path);
+};
+
+/**
+ * The support personas a stage would ACTUALLY get their own session for: the
+ * complete eligibility test, mode set and ref filter in one place.
+ *
+ * The ensemble runner's topology gate and the plan's record of what the
+ * collaborators switch withdrew must ask exactly this question. A mode-only test
+ * claims a withdrawal on a stage whose sessions never existed — a `subagent`
+ * without the hub-and-spoke protocol, or a stage whose support refs resolve to no
+ * AGENT block — and that false audit then reaches `v2.policy.applied`.
+ */
+export const supportSessionRefs = ({ stage, library }) => {
+  if (!SUPPORT_SESSION_MODES.includes(stage?.mode)) return [];
+  if (stage.mode === 'subagent' && !hasRuntimeFile(library, ENSEMBLE_PROTOCOL_FILE)) return [];
+  const leadRef = stage.agentRef ?? stage.leadAgent ?? null;
+  return (stage.supportAgentRefs ?? stage.supportAgents ?? []).filter(
+    (ref) => ref && ref !== leadRef && library?.agentsById?.[ref],
+  );
+};
 
 // Reserved lead-agent refs that are NOT domain AGENT blocks and therefore have no
 // library entry to resolve against. Upstream's initialization stages declare
@@ -382,23 +428,70 @@ const REVIEW_CLASS_RANK = Object.freeze({ none: 0, advisory: 1, adversarial: 2 }
 
 const hasAnyKey = (block, keys) => keys.some((key) => block?.[key] != null);
 
+// A block the import analyzer never judged and the promotion guard never held.
+// Release catalog blocks carry no tenant — they are the verified closure's own
+// rows — and `loadUserOverlay` refuses a SYSTEM pin outright, so a tenant other
+// than SYSTEM is exactly the verbatim user-authored overlay row.
+const isUserAuthored = (block) => block?.tenantId != null && block.tenantId !== SYSTEM_TENANT;
+
 // Reject an out-of-vocabulary policy value instead of guessing a default: an
 // unrecognized value means the release drifted from what this adapter models,
 // and running it as "probably the default" is exactly the silent-divergence
 // failure the release contract exists to prevent.
 const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
   let ok = true;
-  for (const [owner, key, field, allowed] of POLICY_ENUMS) {
+  for (const [owner, key, field, allowed, authoredType, uninterpreted] of POLICY_ENUMS) {
     const block = owner === 'scope' ? scopeBlock : stage;
     const value = block?.[key];
     if (value == null) continue;
-    if (!allowed.includes(value)) {
+    const where = owner === 'scope' ? (scopeBlock?.id ?? 'unknown') : stageId;
+    const at = { ...(owner === 'stage' ? { stageId } : {}), ref: field };
+    // The parsed TYPE first. A singleton array stringifies to its only element
+    // and a quoted boolean to the same text as a real one, so comparing text
+    // alone accepts values no consumer can act on: the runtime compares with
+    // `===`, so `['strict']` matches no branch and `'true'` is not `true`. The
+    // import analyzer checks this for a closure, but a user SCOPE overlay never
+    // passes through it — the plan is that block's first and only judge.
+    if (typeof value !== authoredType) {
       ok = false;
       errors.push(
         err(
           'policy_enum_invalid',
-          `${owner} ${owner === 'scope' ? (scopeBlock?.id ?? 'unknown') : stageId} declares ${field} "${value}"; allowed: ${allowed.join(' | ')}`,
-          { ...(owner === 'stage' ? { stageId } : {}), ref: field },
+          `${owner} ${where} declares ${field} as ${Array.isArray(value) ? 'a list' : typeof value}; it must be authored as ${authoredType === 'boolean' ? 'a YAML boolean' : 'text'}`,
+          at,
+        ),
+      );
+      continue;
+    }
+    // A registry enum is a list of authored value TEXT, and one authored value
+    // is a YAML boolean (`existing_code: true`), so the comparison is on its
+    // text once the type is known to be the authored one.
+    if (!allowed.includes(String(value))) {
+      ok = false;
+      errors.push(
+        err(
+          'policy_enum_invalid',
+          `${owner} ${where} declares ${field} "${value}"; allowed: ${allowed.join(' | ')}`,
+          at,
+        ),
+      );
+      continue;
+    }
+    // Legal, and still not runnable. The ACTIVATION gate below reads the FIELD's
+    // handling, so a field with a consumer switches the policy on for every one
+    // of its legal values — including a value that consumer implements no branch
+    // for, which would then reach runtime as neither of the outcomes it does
+    // implement. A RELEASE authoring such a value is held by the promotion
+    // guard and stays importable and inspectable; a user overlay row is stored
+    // verbatim and meets no guard at all, so this is the only boundary that can
+    // refuse it. Fail closed here until the value's interpretation ships.
+    if (uninterpreted.includes(String(value)) && isUserAuthored(block)) {
+      ok = false;
+      errors.push(
+        err(
+          'policy_value_uninterpreted',
+          `${owner} ${where} declares ${field} "${value}"; this platform has no runtime interpretation for it`,
+          at,
         ),
       );
     }
@@ -420,10 +513,31 @@ const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
 // capability map (see resolveCapabilities): it decides whether a field the
 // catalog OMITS gets its release default or stays inert.
 const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities = {} }) => {
-  const scopeHas = hasAnyKey(scopeBlock, SCOPE_POLICY_KEYS);
-  const stageHas = hasAnyKey(stage, STAGE_POLICY_KEYS);
-  if (!scopeHas && !stageHas) return null;
+  // KNOWN first: every registry-named policy field is type- and enum-checked,
+  // whether or not a handler exists for it yet.
+  if (!hasAnyKey(scopeBlock, SCOPE_POLICY_KEYS) && !hasAnyKey(stage, STAGE_POLICY_KEYS))
+    return null;
   if (!validatePolicyEnums({ scopeBlock, stage, stageId, errors })) return null;
+  // ACTIVATED second: only a field with a consumer may switch the policy on.
+  // Otherwise mapping a field for validation alone would hand its neighbours'
+  // defaults — and the ensemble topology's enablement gate — to a release whose
+  // own setting the platform still drops.
+  const scopeHas = hasAnyKey(scopeBlock, SCOPE_RUNTIME_POLICY_KEYS);
+  const stageHas = hasAnyKey(stage, STAGE_RUNTIME_POLICY_KEYS);
+  if (!scopeHas && !stageHas) return null;
+
+  // ONE effective Guard Policy, resolved new-name-first. `guard_policy` is
+  // 2.11's rename of `change_control`, and the two can disagree on a block the
+  // mapper never saw: a user SCOPE overlay is stored verbatim
+  // (`release-resolver.js` `loadUserOverlay`) and the building-block API keeps
+  // both intrinsic attributes, so a forked scope may carry the new name alone or
+  // both with different values. Resolving it here, once, is what stops a caller
+  // from having to know and synchronize an internal alias. `off` is translated
+  // to "no change control" at the single place that consumes it.
+  const effectiveGuardPolicy =
+    scopeBlock?.guardPolicy ??
+    scopeBlock?.changeControl ??
+    defaultWhenAbsent('SCOPE:change_control', capabilities);
 
   const declaredClass = stage?.reviewClass ?? (stage?.reviewer ? 'adversarial' : 'none');
   const cap = scopeBlock?.reviewCap ?? 'adversarial';
@@ -444,14 +558,31 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
     // authored one. It stays null unless the scope declares it — OR the catalog
     // proves it has change control at all (some SCOPE authors the field), which
     // is upstream's "absent means strict" rule made version-agnostic.
-    changeControl:
-      scopeBlock?.changeControl ?? defaultWhenAbsent('SCOPE:change_control', capabilities),
+    // The AUTHORED new-name value, kept so a scope that chose `off` stays
+    // distinguishable from one that never had the switch.
+    guardPolicy: scopeBlock?.guardPolicy ?? null,
+    changeControl: effectiveGuardPolicy === 'off' ? null : (effectiveGuardPolicy ?? null),
     learnings: scopeBlock?.learnings ?? defaultWhenAbsent('SCOPE:learnings', capabilities),
     skeleton: scopeBlock?.skeleton ?? null,
     // Plan Approval is protocol prose plus a PreToolUse guard upstream, not a
     // frontmatter field, so it is keyed on the CATALOG's runtime files and the
     // stage's own declaration instead of on a (field, value) pair.
-    planApproval: planApprovalApplies({ stage, capabilities }) ? 'required' : null,
+    // 2.11 lets a scope turn the plan gate off. It withdraws THIS key and
+    // nothing else: `humanValidation` is untouched, which is the invariant the
+    // plan suite asserts for every scope and stage.
+    planApproval:
+      scopeBlock?.planApproval !== 'off' && planApprovalApplies({ stage, capabilities })
+        ? 'required'
+        : null,
+    // The project type the scope authors. A human's choice and the workspace
+    // scan are layered on top of it elsewhere; here it is the authored default.
+    existingCode: scopeBlock?.existingCode ?? null,
+    // The collaborator switch. `off` withdraws the support roster: the runtime
+    // resolves NO ensemble topology, which is its existing single-session
+    // contract, so the lead produces every declared output itself. The authored
+    // `mode` and `supportAgentRefs` stay on the stage — the filter is a policy
+    // effect, not a topology rewrite.
+    collaborators: scopeBlock?.collaborators ?? null,
     // The Build-and-Test loop-back is construction-protocol prose upstream, so
     // like Plan Approval it is keyed on the CATALOG rather than on a (field,
     // value) pair. The catalog key says only "this release has a loop-back to
@@ -475,9 +606,10 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
 
 // Apply the resolved policy to the stage instance: the plan is the ONE place
 // the effect is decided, so run-stage never re-derives it from frontmatter.
-// Every reviewer/sensor the policy REMOVES is recorded on `effects` so the
-// runtime can emit an audit event instead of the downgrade being invisible.
-const applyStagePolicy = (instance, policy, effects = null) => {
+// Every reviewer, sensor and support persona the policy REMOVES is recorded on
+// `effects` so the runtime can emit an audit event instead of the downgrade
+// being invisible.
+const applyStagePolicy = (instance, policy, effects = null, library = null) => {
   if (!policy) return instance;
   instance.policy = policy;
   const removedSensors = !policy.sensorsEnabled
@@ -485,6 +617,15 @@ const applyStagePolicy = (instance, policy, effects = null) => {
     : [];
   const removedReviewer =
     policy.reviewClass === 'none' ? (instance.reviewer?.reviewerAgent ?? null) : null;
+  // `collaborators: off` withdraws the support sessions of a support-bearing
+  // stage. The refs stay on the instance (the authored topology is still what
+  // the plan document shows); this list is what the withdrawal costs, named so
+  // the runtime can say which personas did not review the lead's draft. It is
+  // the SAME eligibility question the topology resolver asks — mode, protocol
+  // presence and resolvable refs — or the audit would claim a cost on a stage
+  // that was already a single session.
+  const withdrawnSupportAgents =
+    policy.collaborators === 'off' ? supportSessionRefs({ stage: instance, library }) : [];
   if (!policy.sensorsEnabled) instance.sensors = [];
   if (policy.reviewClass === 'none') {
     instance.reviewer = null;
@@ -496,12 +637,16 @@ const applyStagePolicy = (instance, policy, effects = null) => {
       instance.reviewer = { ...instance.reviewer, artifact: policy.reviewArtifact };
     }
   }
-  if (effects && (removedSensors.length > 0 || removedReviewer)) {
+  if (
+    effects &&
+    (removedSensors.length > 0 || removedReviewer || withdrawnSupportAgents.length > 0)
+  ) {
     effects.push({
       stageId: instance.stageId,
       stageInstanceId: instance.stageInstanceId,
       removedReviewer,
       removedSensors,
+      ...(withdrawnSupportAgents.length > 0 ? { withdrawnSupportAgents } : {}),
       reviewClass: policy.reviewClass,
     });
   }
@@ -913,6 +1058,7 @@ const buildExecutionPlan = ({
           ? resolveStagePolicy({ scopeBlock, stage, stageId, errors, capabilities })
           : null,
         policyEffects,
+        library,
       );
     })
     .filter(Boolean);
