@@ -97,7 +97,7 @@ import {
 } from '../git-engine.js';
 import { resolveStageModel } from '../model-resolver.js';
 import { createGraphWriter, closeGraphSource } from '../mcp/graph-writer.js';
-import { CHECKPOINTS, chosenLabel } from '../mcp/process-bridge.js';
+import { CHECKPOINTS, answerFreeText, chosenLabel } from '../mcp/process-bridge.js';
 import { LOOP_BACK_OPTION, parseChoice } from '../../shared/gate-answer.js';
 import { ingestStageCodeTraceability as defaultIngestStageCodeTraceability } from '../code-traceability.js';
 import { createSensorRunner, isReleaseDependencyError } from '../sensor-runner.js';
@@ -1304,7 +1304,8 @@ const runCheckpointLadder = async ({
 // Render an answered gate into the message that re-enters the parked conversation.
 // The agent asked structured questions; we feed back the human's answer so it
 // continues from where it parked. Tolerant of the answer shapes the resume lambda
-// / phaseb-answer write (`perQuestion[]`, `freeText`, or a raw string).
+// / phaseb-answer / gate UI write (`perQuestion[]`, `answers[]`, `freeText`, or a
+// raw string).
 const formatResumeAnswer = (gate, stageId) => {
   const a = gate?.answer ?? null;
   // A checkpoint gate (summary confirmation / plan approval) is a `question` row
@@ -1315,9 +1316,9 @@ const formatResumeAnswer = (gate, stageId) => {
   if (checkpoint) {
     // The same label parser and labels the bridge uses to decide whether a
     // receipt is written, so this message never contradicts the receipt.
-    const label = chosenLabel(a);
+    const label = chosenLabel(a, gate.questions);
     const approved = label === CHECKPOINTS[checkpoint]?.approve;
-    const free = typeof a === 'string' ? '' : (a?.freeText ?? a?.feedback ?? '');
+    const free = answerFreeText(a);
     if (approved) {
       return (
         `The human answered the ${checkpoint} checkpoint: "${label}".` +

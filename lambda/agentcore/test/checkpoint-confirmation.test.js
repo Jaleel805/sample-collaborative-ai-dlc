@@ -233,6 +233,42 @@ describe('confirm_summary — the authorization it does and does not create', ()
     expect(store.receipts.size).toBe(1);
   });
 
+  // The gate UI (QuestionEditor) answers with option indices into the gate's own
+  // questions, not with the label: `{ answers: [{ selectedOptions: [i] }] }`.
+  it('reads the gate UI answer shape: option indices resolved against the gate options', async () => {
+    const store = fakeStore();
+    const rejecting = inlineBridge(store, {
+      answer: { answers: [{ selectedOptions: [1], freeText: 'model refunds too' }] },
+    });
+    const first = await rejecting.confirmSummary({ summary: 'v1' });
+    expect(first.decision).toBe('changes-requested');
+    expect(first.choice).toBe('Request changes');
+    expect(first.feedback).toBe('model refunds too');
+    expect(store.receipts.size).toBe(0);
+
+    const accepting = inlineBridge(store, { answer: { answers: [{ selectedOptions: [0] }] } });
+    const second = await accepting.confirmSummary({ summary: 'v2 with refunds' });
+    expect(second.decision).toBe('approved');
+    expect(second.choice).toBe('Looks correct');
+    expect(store.receipts.size).toBe(1);
+  });
+
+  it('creates NO authority from a malformed gate UI answer', async () => {
+    for (const answer of [
+      { answers: [{ selectedOptions: [0, 1] }] },
+      { answers: [{ selectedOptions: [2] }] },
+      { answers: [{ selectedOptions: [-1] }] },
+      { answers: [{ selectedOptions: [null] }] },
+      { answers: [{ selectedOptions: ['0'] }] },
+      { answers: [{ selectedOptions: [], freeText: 'Looks correct' }] },
+    ]) {
+      const store = fakeStore();
+      const result = await inlineBridge(store, { answer }).confirmSummary({ summary: 'a summary' });
+      expect(result.decision).toBe('re-ask');
+      expect(store.receipts.size).toBe(0);
+    }
+  });
+
   it('refuses to raise the checkpoint forever', async () => {
     const store = fakeStore();
     // Pre-fill every round slot as answered-but-rejected.
@@ -368,6 +404,18 @@ describe('park / resume across a confirmation', () => {
       artifactType: 'business-logic-model',
       authorizationId,
     });
+  });
+
+  it('mints the receipt on the resume leg from a gate UI answer', async () => {
+    const store = fakeStore();
+    await parkingBridge(store).confirmSummary({ summary: 'please confirm' });
+    answerLatestGate(store, { answers: [{ selectedOptions: [0] }] });
+
+    const resumed = createProcessBridge({ store, scope: SCOPE });
+    const authorizationId = await resumed.rehydrateAuthorizations();
+
+    expect(authorizationId).toMatch(/^RECEIPT#summary-confirmation#si-1#0#-$/);
+    expect(eventTypes(store)).toContain('v2.summary.confirmed');
   });
 
   it('does not invent an authorization from a parked or rejected gate', async () => {
@@ -850,28 +898,34 @@ describe('checkpoint authority is the latest decision, not the first', () => {
     ]);
   });
 
-  it('withdraws it on the resume leg too, when the rejection was answered while parked', async () => {
-    const store = fakeStore();
-    const confirming = inlineBridge(store, {
-      answer: { perQuestion: [{ answer: 'Looks correct' }] },
-    });
-    await confirming.confirmSummary({ summary: 'v1' });
-    await confirming.stampArtifact({ artifactId: 'd1', artifactType: 'design' });
-    expect(evaluate(store).ok).toBe(true);
+  it.each([
+    ['a perQuestion answer', { perQuestion: [{ answer: 'Request changes' }] }],
+    ['a gate UI answer', { answers: [{ selectedOptions: [1] }] }],
+  ])(
+    'withdraws it on the resume leg too, when the rejection was answered while parked (%s)',
+    async (_shape, rejection) => {
+      const store = fakeStore();
+      const confirming = inlineBridge(store, {
+        answer: { perQuestion: [{ answer: 'Looks correct' }] },
+      });
+      await confirming.confirmSummary({ summary: 'v1' });
+      await confirming.stampArtifact({ artifactId: 'd1', artifactType: 'design' });
+      expect(evaluate(store).ok).toBe(true);
 
-    // Round 1 parks and is answered by the human while no container exists.
-    await parkingBridge(store).confirmSummary({ summary: 'a different summary' });
-    answerLatestGate(store, { perQuestion: [{ answer: 'Request changes' }] });
+      // Round 1 parks and is answered by the human while no container exists.
+      await parkingBridge(store).confirmSummary({ summary: 'a different summary' });
+      answerLatestGate(store, rejection);
 
-    const resumed = createProcessBridge({ store, scope: SCOPE });
-    expect(await resumed.rehydrateAuthorizations()).toBeNull();
+      const resumed = createProcessBridge({ store, scope: SCOPE });
+      expect(await resumed.rehydrateAuthorizations()).toBeNull();
 
-    const result = evaluate(store);
-    expect(result.ok).toBe(false);
-    expect(result.findings.map((finding) => finding.code)).toEqual([
-      'summary_confirmation_missing',
-    ]);
-  });
+      const result = evaluate(store);
+      expect(result.ok).toBe(false);
+      expect(result.findings.map((finding) => finding.code)).toEqual([
+        'summary_confirmation_missing',
+      ]);
+    },
+  );
 
   it('records the parked withdrawal once, however many containers resume after it', async () => {
     const store = fakeStore();

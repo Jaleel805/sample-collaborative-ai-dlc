@@ -82,12 +82,45 @@ const authorizationRefusal = (gate) => {
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
+// The gate UI's answer shape: `answers[0].selectedOptions` holds indices into the
+// gate's own `questions[0].options`, so the label is read from the gate row. Only
+// one well-formed index names a label; anything else names none.
+const selectedOptionLabel = (answer, questions) => {
+  const selected = answer?.answers?.[0]?.selectedOptions;
+  if (!Array.isArray(selected) || selected.length !== 1) return null;
+  const [index] = selected;
+  if (!Number.isInteger(index) || index < 0) return null;
+  let parsed = questions;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return null;
+    }
+  }
+  return Array.isArray(parsed) ? (parsed[0]?.options?.[index]?.label ?? null) : null;
+};
+
+// The human's free-text note, across the same answer shapes as chosenLabel.
+export const answerFreeText = (answer) =>
+  typeof answer === 'string'
+    ? ''
+    : (answer?.freeText ?? answer?.answers?.[0]?.freeText ?? answer?.feedback ?? '');
+
 // The human's chosen label, across every answer shape the answer endpoints write
-// (`perQuestion[]`, `freeText`, or a bare string — see run-stage formatResumeAnswer).
-export const chosenLabel = (answer) => {
+// (`perQuestion[]`, the gate UI's `answers[].selectedOptions` resolved against the
+// gate's `questions`, `freeText`, `decision`, or a bare string — see run-stage
+// formatResumeAnswer). A note typed in the gate UI is feedback, never a label.
+export const chosenLabel = (answer, questions) => {
   if (typeof answer === 'string') return answer.trim();
   const perQuestion = Array.isArray(answer?.perQuestion) ? answer.perQuestion[0]?.answer : null;
-  return String(perQuestion ?? answer?.freeText ?? answer?.decision ?? '').trim();
+  return String(
+    perQuestion ??
+      selectedOptionLabel(answer, questions) ??
+      answer?.freeText ??
+      answer?.decision ??
+      '',
+  ).trim();
 };
 
 export const createProcessBridge = ({
@@ -342,11 +375,9 @@ export const createProcessBridge = ({
   // the human's words, and any other shape is a re-ask with no receipt — so a
   // free-text answer can never be mistaken for a confirmation.
   const resolveCheckpointAnswer = async ({ spec, checkpoint, task }) => {
-    const label = chosenLabel(task.answer);
+    const label = chosenLabel(task.answer, task.questions);
     const feedback =
-      typeof task.answer === 'string'
-        ? task.answer
-        : (task.answer?.freeText ?? task.answer?.feedback ?? label);
+      typeof task.answer === 'string' ? task.answer : answerFreeText(task.answer) || label;
     if (label === spec.approve) {
       // The same provenance rule the resume leg applies: an answer that records
       // no human, or no digest of what was shown, authorizes nothing.
@@ -521,7 +552,7 @@ export const createProcessBridge = ({
         if (
           latest &&
           latest.humanTaskId !== existing.humanTaskId &&
-          chosenLabel(latest.answer) === spec.reject
+          chosenLabel(latest.answer, latest.questions) === spec.reject
         ) {
           continue;
         }
@@ -529,7 +560,7 @@ export const createProcessBridge = ({
         continue;
       }
       if (!latest || latest.status === 'pending') continue;
-      if (chosenLabel(latest.answer) === spec.reject) {
+      if (chosenLabel(latest.answer, latest.questions) === spec.reject) {
         // The rejection was answered while no container existed, so nothing has
         // recorded the withdrawal yet. Writing it here is what stops an EARLIER
         // round's approval from still satisfying the durable evaluator — and it is
@@ -559,7 +590,7 @@ export const createProcessBridge = ({
         }
         continue;
       }
-      if (chosenLabel(latest.answer) !== spec.approve) continue;
+      if (chosenLabel(latest.answer, latest.questions) !== spec.approve) continue;
       const refusal = authorizationRefusal(latest);
       if (refusal) {
         await refuseAuthorization({
