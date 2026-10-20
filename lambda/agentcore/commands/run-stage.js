@@ -1304,8 +1304,7 @@ const runCheckpointLadder = async ({
 // Render an answered gate into the message that re-enters the parked conversation.
 // The agent asked structured questions; we feed back the human's answer so it
 // continues from where it parked. Tolerant of the answer shapes the resume lambda
-// / phaseb-answer / gate UI write (`perQuestion[]`, `answers[]`, `freeText`, or a
-// raw string).
+// / phaseb-answer write (`perQuestion[]`, `freeText`, or a raw string).
 const formatResumeAnswer = (gate, stageId) => {
   const a = gate?.answer ?? null;
   // A checkpoint gate (summary confirmation / plan approval) is a `question` row
@@ -1315,8 +1314,9 @@ const formatResumeAnswer = (gate, stageId) => {
   const checkpoint = gate?.detail?.checkpoint ?? null;
   if (checkpoint) {
     // The same label parser and labels the bridge uses to decide whether a
-    // receipt is written, so this message never contradicts the receipt.
-    const label = chosenLabel(a, gate.questions);
+    // receipt is written, so this message never contradicts the receipt. It also
+    // reads the gate UI's `answers[]` shape (option indices into `gate.questions`).
+    const label = chosenLabel(gate);
     const approved = label === CHECKPOINTS[checkpoint]?.approve;
     const free = answerFreeText(a);
     if (approved) {

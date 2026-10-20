@@ -89,34 +89,31 @@ const selectedOptionLabel = (answer, questions) => {
   const selected = answer?.answers?.[0]?.selectedOptions;
   if (!Array.isArray(selected) || selected.length !== 1) return null;
   const [index] = selected;
-  if (!Number.isInteger(index) || index < 0) return null;
-  let parsed = questions;
-  if (typeof parsed === 'string') {
-    try {
-      parsed = JSON.parse(parsed);
-    } catch {
-      return null;
-    }
+  if (!Number.isInteger(index)) return null;
+  try {
+    return JSON.parse(questions)?.[0]?.options?.[index]?.label ?? null;
+  } catch {
+    return null;
   }
-  return Array.isArray(parsed) ? (parsed[0]?.options?.[index]?.label ?? null) : null;
 };
 
-// The human's free-text note, across the same answer shapes as chosenLabel.
+// The human's free-text note: top-level `freeText`, the gate UI's
+// `answers[0].freeText`, or `feedback`; '' for a bare string.
 export const answerFreeText = (answer) =>
-  typeof answer === 'string'
-    ? ''
-    : (answer?.freeText ?? answer?.answers?.[0]?.freeText ?? answer?.feedback ?? '');
+  answer?.freeText ?? answer?.answers?.[0]?.freeText ?? answer?.feedback ?? '';
 
-// The human's chosen label, across every answer shape the answer endpoints write
-// (`perQuestion[]`, the gate UI's `answers[].selectedOptions` resolved against the
-// gate's `questions`, `freeText`, `decision`, or a bare string — see run-stage
-// formatResumeAnswer). A note typed in the gate UI is feedback, never a label.
-export const chosenLabel = (answer, questions) => {
+// The human's chosen label on an answered gate row, across every answer shape the
+// answer endpoints write (`perQuestion[]`, the gate UI's `answers[0].selectedOptions`
+// resolved against the row's `questions`, `freeText`, `decision`, or a bare string —
+// see run-stage formatResumeAnswer). The gate UI's `answers[0].freeText` is
+// feedback, never a label.
+export const chosenLabel = (gate) => {
+  const answer = gate?.answer;
   if (typeof answer === 'string') return answer.trim();
   const perQuestion = Array.isArray(answer?.perQuestion) ? answer.perQuestion[0]?.answer : null;
   return String(
     perQuestion ??
-      selectedOptionLabel(answer, questions) ??
+      selectedOptionLabel(answer, gate?.questions) ??
       answer?.freeText ??
       answer?.decision ??
       '',
@@ -375,9 +372,8 @@ export const createProcessBridge = ({
   // the human's words, and any other shape is a re-ask with no receipt — so a
   // free-text answer can never be mistaken for a confirmation.
   const resolveCheckpointAnswer = async ({ spec, checkpoint, task }) => {
-    const label = chosenLabel(task.answer, task.questions);
-    const feedback =
-      typeof task.answer === 'string' ? task.answer : answerFreeText(task.answer) || label;
+    const label = chosenLabel(task);
+    const feedback = answerFreeText(task.answer) || label;
     if (label === spec.approve) {
       // The same provenance rule the resume leg applies: an answer that records
       // no human, or no digest of what was shown, authorizes nothing.
@@ -511,6 +507,7 @@ export const createProcessBridge = ({
     if (!policy) return null;
     for (const [checkpoint, spec] of Object.entries(CHECKPOINTS)) {
       const { latest } = await latestCheckpointGate(checkpoint);
+      const latestLabel = latest ? chosenLabel(latest) : '';
       const round = latest ? checkpointRoundOf(checkpoint, latest) : 0;
       const existing = await store
         .getReceipt(executionId, {
@@ -549,18 +546,14 @@ export const createProcessBridge = ({
           continue;
         }
         // A "Request changes" answered after this confirmation withdrew it.
-        if (
-          latest &&
-          latest.humanTaskId !== existing.humanTaskId &&
-          chosenLabel(latest.answer, latest.questions) === spec.reject
-        ) {
+        if (latest && latest.humanTaskId !== existing.humanTaskId && latestLabel === spec.reject) {
           continue;
         }
         activeAuthorizationId = existing.sk;
         continue;
       }
       if (!latest || latest.status === 'pending') continue;
-      if (chosenLabel(latest.answer, latest.questions) === spec.reject) {
+      if (latestLabel === spec.reject) {
         // The rejection was answered while no container existed, so nothing has
         // recorded the withdrawal yet. Writing it here is what stops an EARLIER
         // round's approval from still satisfying the durable evaluator — and it is
@@ -590,7 +583,7 @@ export const createProcessBridge = ({
         }
         continue;
       }
-      if (chosenLabel(latest.answer, latest.questions) !== spec.approve) continue;
+      if (latestLabel !== spec.approve) continue;
       const refusal = authorizationRefusal(latest);
       if (refusal) {
         await refuseAuthorization({
