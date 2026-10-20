@@ -97,7 +97,7 @@ import {
 } from '../git-engine.js';
 import { resolveStageModel } from '../model-resolver.js';
 import { createGraphWriter, closeGraphSource } from '../mcp/graph-writer.js';
-import { CHECKPOINTS, chosenLabel } from '../mcp/process-bridge.js';
+import { CHECKPOINTS, answerFreeText, chosenLabel } from '../mcp/process-bridge.js';
 import { LOOP_BACK_OPTION, parseChoice } from '../../shared/gate-answer.js';
 import { ingestStageCodeTraceability as defaultIngestStageCodeTraceability } from '../code-traceability.js';
 import { createSensorRunner, isReleaseDependencyError } from '../sensor-runner.js';
@@ -1315,10 +1315,11 @@ const formatResumeAnswer = (gate, stageId) => {
   const checkpoint = gate?.detail?.checkpoint ?? null;
   if (checkpoint) {
     // The same label parser and labels the bridge uses to decide whether a
-    // receipt is written, so this message never contradicts the receipt.
-    const label = chosenLabel(a);
+    // receipt is written, so this message never contradicts the receipt. It also
+    // reads the gate UI's `answers[]` shape (option indices into `gate.questions`).
+    const label = chosenLabel(gate);
     const approved = label === CHECKPOINTS[checkpoint]?.approve;
-    const free = typeof a === 'string' ? '' : (a?.freeText ?? a?.feedback ?? '');
+    const free = answerFreeText(a);
     if (approved) {
       return (
         `The human answered the ${checkpoint} checkpoint: "${label}".` +
