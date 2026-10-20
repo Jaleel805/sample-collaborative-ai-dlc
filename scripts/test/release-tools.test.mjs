@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { stubPublicEcr } from './helpers/public-ecr.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const installer = join(root, 'scripts/install.sh');
@@ -122,26 +123,24 @@ test('release and main deployments use isolated protected environments and GitHu
     /TF_PROJECT_NAME: \$\{\{ inputs\.terraform_project_name \|\| 'collaborative-ai-dlc' \}\}/,
   );
   assert.match(deployment, /printf 'project_name  = %s\\n'/);
-  assert.match(deployment, /TF_RECREATE_MISSING_LAMBDA_PACKAGE: 'false'/);
+  assert.doesNotMatch(deployment, /TF_RECREATE_MISSING_LAMBDA_PACKAGE/);
   assert.match(deployment, /role-to-assume: \$\{\{ vars\.AWS_ROLE_ARN \}\}/);
   assert.match(deployment, /TF_STATE_BUCKET: \$\{\{ vars\.TF_STATE_BUCKET \}\}/);
   assert.match(deployment, /docker\/setup-qemu-action@[0-9a-f]{40}/);
   assert.match(deployment, /platforms: arm64/);
-  assert.match(deployment, /python3 "\$package_script" build --timestamp 0/);
   assert.match(deployment, /AUTH_DOMAIN: \$\{\{ secrets\.AUTH_DOMAIN \}\}/);
   assert.match(deployment, /AUTH_MODE: \$\{\{ vars\.AUTH_MODE \}\}/);
   assert.match(deployment, /SSO_CONFIG: \$\{\{ secrets\.SSO_CONFIG \}\}/);
   assert.match(deployment, /printf 'auth_domain {10}= %s\\n'/);
   assert.match(deployment, /node scripts\/sso-config\.mjs "\$sso_input" "\$AUTH_MODE"/);
   assert.match(deployment, /\$TF_ENVIRONMENT\.sso\.tfvars\.json/);
-  assert.match(deployment, /AIDLC_SKIP_NPM_CI: '1'/);
   assert.match(deployment, /deploy-terraform\.sh "\$TF_ENVIRONMENT"/);
   assert.match(deployment, /deploy-frontend\.sh "\$TF_ENVIRONMENT"/);
   assert.match(deployment, /case "\$DEPLOY_REF_TYPE" in/);
   assert.match(deployment, /release-tag\)/);
   assert.match(deployment, /commit\)/);
   assert.match(deployment, /git merge-base --is-ancestor "\$deploy_commit" "\$main_commit"/);
-  assert.equal(deployment.match(/--phase plan/g)?.length, 2);
+  assert.doesNotMatch(deployment, /--phase|package\.py|require-lambda-packages/);
   assert.doesNotMatch(deployment, /inputs\.apply|plan-only/);
   assert.doesNotMatch(deployment, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY/);
   assert.ok(
@@ -155,13 +154,9 @@ test('release and main deployments use isolated protected environments and GitHu
     'ARM64 emulation must be configured before Terraform builds the AgentCore image',
   );
   assert.ok(
-    deployment.indexOf('- name: Prepare Lambda package plans') <
-      deployment.indexOf('- name: Build Lambda packages') &&
-      deployment.indexOf('- name: Build Lambda packages') <
-        deployment.indexOf('- name: Plan infrastructure') &&
-      deployment.indexOf('- name: Plan infrastructure') <
-        deployment.indexOf('- name: Apply infrastructure'),
-    'Lambda packages must be built before the final saved plan is applied',
+    deployment.indexOf('- name: Deploy infrastructure') <
+      deployment.indexOf('- name: Deploy frontend'),
+    'frontend deployment must follow the infrastructure script',
   );
 });
 
@@ -519,7 +514,8 @@ case "$*" in
     ;;
   *"show -json "*) printf '{"resource_changes":[]}\\n' ;;
   *" output -raw application_url"*) printf 'https://app.example.invalid\\n' ;;
-  *" output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw v2_executions_table_name"*) printf 'auth-summary\\n' ;;
   *" output -raw environment"*) printf 'summary\\n' ;;
   *" output -raw seed_blocks_lambda_name"*) printf 'seed-summary\\n' ;;
 esac
@@ -543,12 +539,25 @@ fi
     { mode: 0o755 },
   );
 
+  writeFileSync(
+    join(bin, 'node'),
+    `#!/usr/bin/env bash
+if [[ "$1" == */initialize-agent-auth-inventory.mjs ]]; then
+  exit 0
+fi
+exec '${process.execPath}' "$@"
+`,
+    { mode: 0o755 },
+  );
+
+  stubPublicEcr(bin);
   const deployed = run(
     'bash',
     [deployTerraform, 'summary', '--plan-file', join(dir, 'summary.tfplan')],
     {
       env: {
         PATH: `${bin}:${process.env.PATH}`,
+        DOCKER_CONFIG: join(dir, 'docker'),
         AIDLC_CONFIG_DIR: join(dir, 'config'),
         AIDLC_SKIP_NPM_CI: '1',
       },
@@ -608,7 +617,8 @@ case "$*" in
   *" output -raw oidc_idp_callback_url"*) printf 'https://broker.example.invalid/oauth2/idpresponse\\n' ;;
   *" output -raw saml_acs_url"*) printf 'https://broker.example.invalid/saml2/idpresponse\\n' ;;
   *" output -raw saml_entity_id"*) printf 'urn:amazon:cognito:sp:eu-west-1_pool\\n' ;;
-  *" output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw v2_executions_table_name"*) printf 'auth-summary\\n' ;;
   *" output -raw environment"*) printf 'summary\\n' ;;
   *" output -raw seed_blocks_lambda_name"*) printf 'seed-summary\\n' ;;
 esac
@@ -633,9 +643,23 @@ fi
     { mode: 0o755 },
   );
 
+  writeFileSync(
+    join(bin, 'node'),
+    `#!/usr/bin/env bash
+if [[ "$1" == */initialize-agent-auth-inventory.mjs ]]; then
+  printf 'initialize-inventory %s %s\\n' "$AWS_REGION" "$V2_PROCESS_TABLE" >> "$AIDLC_TERRAFORM_LOG"
+  exit "\${AIDLC_FAKE_INVENTORY_EXIT:-0}"
+fi
+exec '${process.execPath}' "$@"
+`,
+    { mode: 0o755 },
+  );
+
+  stubPublicEcr(bin);
   return {
     env: {
       PATH: `${bin}:${process.env.PATH}`,
+      DOCKER_CONFIG: join(dir, 'docker'),
       AIDLC_CONFIG_DIR: join(dir, 'config'),
       AIDLC_SKIP_NPM_CI: '1',
       AIDLC_TERRAFORM_LOG: terraformLog,
@@ -654,6 +678,29 @@ fi
     planFile: join(dir, 'summary.tfplan'),
   };
 };
+
+test('standalone all/apply fails Public ECR authentication before Terraform or retired-task mutations', (t) => {
+  for (const phase of ['all', 'apply']) {
+    const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-ecr-denied-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const { env, terraformLog, awsLog, planFile } = standaloneDeployEnv(dir);
+    writeFileSync(planFile, 'saved plan');
+    const result = run(
+      'bash',
+      [deployTerraform, 'summary', '--phase', phase, '--plan-file', planFile],
+      {
+        env: { ...env, ECR_TEST_LOGIN_FAIL: '1' },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken in us-east-1/,
+    );
+    assert.ok(!existsSync(terraformLog));
+    assert.ok(!existsSync(awsLog));
+  }
+});
 
 test('standalone deployment forwards --var overrides to terraform plan', () => {
   const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-var-'));
@@ -711,6 +758,39 @@ test('standalone deployment can skip the post-apply baseline seed', () => {
 
   assert.equal(deployed.status, 0, deployed.stderr);
   assert.match(deployed.stdout, /Skipping AI-DLC default workflow/);
+  assert.doesNotMatch(readFileSync(awsLog, 'utf8'), /lambda invoke/);
+});
+
+test('deployment initializes inventory after apply even when baseline seeding is skipped', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-inventory-'));
+  const { env, terraformLog, planFile } = standaloneDeployEnv(dir);
+  const planned = run(
+    'bash',
+    [deployTerraform, 'summary', '--phase', 'plan', '--plan-file', planFile],
+    { env },
+  );
+  assert.equal(planned.status, 0, planned.stderr);
+  assert.doesNotMatch(readFileSync(terraformLog, 'utf8'), /initialize-inventory/);
+  const applied = run(
+    'bash',
+    [deployTerraform, 'summary', '--phase', 'apply', '--plan-file', planFile, '--skip-seed'],
+    { env },
+  );
+  assert.equal(applied.status, 0, applied.stderr);
+  const log = readFileSync(terraformLog, 'utf8');
+  assert.match(log, /initialize-inventory eu-west-1 auth-summary/);
+  assert.ok(log.indexOf(`apply ${planFile}`) < log.indexOf('initialize-inventory'));
+});
+
+test('deployment fails and retains the plan when inventory initialization fails', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-inventory-failed-'));
+  const { env, awsLog, planFile } = standaloneDeployEnv(dir);
+  const result = run('bash', [deployTerraform, 'summary', '--plan-file', planFile], {
+    env: { ...env, AIDLC_FAKE_INVENTORY_EXIT: '1' },
+  });
+  assert.equal(result.status, 1);
+  assert.ok(existsSync(planFile));
+  assert.doesNotMatch(result.stdout, /Infrastructure deployment complete/);
   assert.doesNotMatch(readFileSync(awsLog, 'utf8'), /lambda invoke/);
 });
 
@@ -1011,7 +1091,10 @@ test('standalone destroy refuses production even when confirmation is bypassed',
     join(bin, 'terraform'),
     `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$TERRAFORM_LOG"
-[[ "$*" == *" console "* ]] && printf 'true\\n'
+if [[ "$*" == *" console "* ]]; then
+  cat >/dev/null
+  printf 'true\\n'
+fi
 exit 0
 `,
     { mode: 0o755 },

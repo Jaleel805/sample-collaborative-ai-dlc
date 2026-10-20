@@ -114,6 +114,17 @@ export interface Intent {
   resumeRequired?: IntentResumeRequired | null;
   agentCli?: AgentCli | null;
   credentialSource?: AgentCredentialSource | null;
+  credentialConnection?: {
+    mode: string;
+    backend: string;
+    mechanism: string;
+    source: AgentCredentialSource;
+    connectionId: string | null;
+    connectionRevision: number | null;
+    policyRevision: number | null;
+    configuration: { endpoint?: string; issuer?: string };
+    legacy: boolean;
+  } | null;
   cliModels: Record<string, string> | null;
   environment: IntentEnvironmentSnapshot | null;
   parkReleaseSeconds: number | null;
@@ -121,6 +132,9 @@ export interface Intent {
   // (0/null = unbounded) and the human's autonomy-ladder decision.
   maxParallelUnits?: number | null;
   constructionAutonomyMode?: 'gated' | 'autonomous' | null;
+  // The grant for the SEQUENTIAL construction stage gates. Distinct from the
+  // field above, which is the unit-lane ladder's per-section decision.
+  constructionGateAutonomy?: 'gated' | 'autonomous' | null;
   prStrategy?: 'intent-pr' | 'pr-per-unit' | null;
   // Per-intent stage skipping (shared/stage-skip.js): the effective mode
   // snapshotted at create and the CONDITIONAL stages deselected at create.
@@ -438,8 +452,33 @@ export interface IntentSensorRun {
   timestamp: string;
 }
 
+// A single bounded harness failure group. The backend redacts and de-duplicates
+// these entries before persistence; the UI renders only these allowlisted fields.
+export interface SensorHarnessFailure {
+  reason?: string;
+  result?: string;
+  exitCode?: number | null;
+  stderr?: string | null;
+  fileCount?: number;
+  sampleFiles?: string[];
+}
+
+export interface SensorFileDiagnostic {
+  file: string;
+  result?: string;
+  timedOut?: boolean;
+  // `null` when the file produced no detail (a timeout, or no verdict at all).
+  detail?: {
+    reason?: string;
+    exitCode?: number | null;
+    stderr?: string | null;
+    [key: string]: unknown;
+  } | null;
+}
+
 // Loosely-typed sensor verdict detail — the fields any evaluator may emit. All
-// optional; the UI reads whichever are present.
+// optional; the UI reads whichever are present. Script sensors additionally
+// expose a backend-bounded, pre-redacted diagnostic summary.
 export interface SensorDetail {
   artifacts?: { artifact: string; reason?: string; id?: string | null }[];
   unreferenced?: string[];
@@ -448,9 +487,12 @@ export interface SensorDetail {
   error?: string;
   notApplicable?: boolean;
   findings_count?: number;
+  harnessFailures?: SensorHarnessFailure[];
   // A `script` sensor runs once per matching file, so the runner aggregates the
   // per-file verdicts here and the explanation sits on the entry, not the top.
-  files?: { file?: string; result?: string; timedOut?: boolean; detail?: SensorDetail | null }[];
+  files?: SensorFileDiagnostic[];
+  filesOmitted?: number;
+  omissionReason?: string;
   [key: string]: unknown;
 }
 
@@ -754,6 +796,10 @@ export interface UnitReviewComment {
 
 export type FeedbackBatchState = 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
 
+export type ChangedFileProvenance =
+  | { state: 'known'; files: string[] }
+  | { state: 'unknown'; reason: string; detail?: string };
+
 export interface IntentFeedbackBatch {
   sectionIndex: number;
   unitSlug: string;
@@ -764,6 +810,7 @@ export interface IntentFeedbackBatch {
   requestedByName: string | null;
   stageInstanceId: string | null;
   output: string | null;
+  changedFileProvenance: ChangedFileProvenance | null;
   changedFiles: string[] | null;
   verification: string | null;
   commitSha: string | null;
@@ -826,6 +873,17 @@ export interface CreateIntentInput {
   // selectable releases are accepted; 400 codes: release_not_selectable,
   // release_not_found, release_selection_disabled. Omit for legacy behaviour.
   methodologyReleaseId?: string;
+  // Freeze the construction autonomy grant at create: 'autonomous' lets the run
+  // complete the construction stage gates after the first one without stopping
+  // (failures, Plan Approval and blocking findings still halt). Omit — or send
+  // 'gated', on any release — for a gate after every construction stage.
+  // 'autonomous' is only accepted on an intent whose AI-DLC release authors the
+  // protocol; 400 code: construction_autonomy_unavailable. The grant holds for
+  // the rest of the intent, rewinds included, until the intent is cancelled.
+  // Cancel is only accepted while the intent is parked or failed: a waived gate
+  // never parks, so an autonomous run can be cancelled once it halts at a human
+  // gate, a question or a failure.
+  constructionGateAutonomy?: 'gated' | 'autonomous';
   // Optional tracker provenance when seeded from a GitHub issue / Jira artifact.
   source?: {
     bindingId: string;

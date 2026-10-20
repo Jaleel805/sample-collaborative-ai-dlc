@@ -29,7 +29,6 @@ import { Logger } from '@aws-lambda-powertools/logger';
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
-  StopRuntimeSessionCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
 import { requirePlatformAdmin } from '../shared/authz.js';
 import {
@@ -37,8 +36,19 @@ import {
   resolveEnvironmentSnapshot,
 } from '../shared/environment-snapshot.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
-import { createProcessStore } from '../shared/v2-process-store.js';
-import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
+import {
+  GRANT_AUTONOMY_OPTION,
+  constructionAutonomyApplies,
+} from '../shared/construction-autonomy.js';
+import { SessionReleaseHandoffError, stopSessions } from '../shared/runtime-session.js';
+import {
+  composeSessionIdFor,
+  intentSessionIdFor,
+  laneSessionIdFor,
+} from '../shared/runtime-session-ids.js';
+import { createSessionCleanupStore } from '../shared/session-cleanup-store.js';
+import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
+import { CONSTRUCTION_AUTONOMY_MODES, isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
 import { buildResponse } from '../shared/response.js';
 import { logSafeEventIfEnabled } from '../shared/safe-event-logger.js';
@@ -111,9 +121,11 @@ import {
 } from '../shared/release-registry.js';
 import { parseLambdaPayload } from '../shared/lambda-payload.js';
 import { mapWithConcurrency } from '../shared/concurrency.js';
-import { credentialProviderForCli } from '../shared/agent-credentials.js';
-import { resolveEffectiveCredentialBindingsViaBroker } from '../shared/agent-credential-metadata.js';
-import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
+import {
+  resolveSelectedAgentCredential,
+  prepareAgentInvocation,
+} from '../shared/agent-credential-service.js';
+import { credentialBindingDisplay } from '../shared/agent-auth-contracts.js';
 import { SYSTEM_TENANT } from '../shared/tenant.js';
 import { fetchKnowledgeGraph } from './knowledge-graph.js';
 import { buildIntentAudit } from './audit.js';
@@ -133,7 +145,7 @@ import {
   createAttachmentCleanupService,
   pendingAttachmentDeletions,
   validateAttachmentDescriptor,
-} from '../shared/intent-attachments.js';
+} from './attachments.js';
 import {
   GATE_CHOICES,
   LOOP_BACK_OPTION,
@@ -151,6 +163,12 @@ const ssm = new SSMClient({});
 const s3 = new S3Client({});
 const lambdaClient = new LambdaClient({});
 const agentcore = new BedrockAgentCoreClient({});
+// Failed workspace releases on intent deletion are queued here and retried by
+// the environments status poller (shared/runtime-session.js).
+const sessionCleanupStore = createSessionCleanupStore({
+  ddb,
+  tableName: process.env.ENVIRONMENT_REGISTRY_TABLE,
+});
 const store = createProcessStore({ ddb });
 const logger = new Logger({ persistentKeys: { component: 'intents' } });
 
@@ -189,59 +207,9 @@ const attachmentCleanup = createAttachmentCleanupService({
 const attachmentEventKey = /^intent-attachments\/staging\/([^/]+)\/([^.]+)(\.[a-z0-9]+)$/i;
 const ATTACHMENT_PROMOTION_CAS_ATTEMPTS = 4;
 
-const resolveSelectedAgentCredential = async ({ projectId, userId, agentCli }) => {
-  const provider = credentialProviderForCli(agentCli);
-  if (!provider) {
-    return {
-      error: {
-        statusCode: 400,
-        body: {
-          error: `Unsupported agent CLI "${agentCli || ''}"`,
-          code: 'unsupported_agent_cli',
-        },
-      },
-    };
-  }
-  const bindings = await resolveEffectiveCredentialBindingsViaBroker({
-    projectId,
-    userId,
-  });
-  const credentialBinding = bindings[provider];
-  if (!credentialBinding) {
-    return {
-      error: {
-        statusCode: 409,
-        body: {
-          error: `No ${provider === 'kiro' ? 'Kiro' : 'Bedrock'} credential is available for this CLI`,
-          code: 'agent_credential_required',
-          provider,
-        },
-      },
-    };
-  }
-  return { provider, credentialBinding };
-};
-
-const issueInvocationAgentCredentialGrant = async ({
-  purpose,
-  projectId,
-  executionId,
-  credentialBinding = null,
-  agentCli = null,
-}) => {
-  const binding =
-    credentialBinding ??
-    (credentialProviderForCli(agentCli)
-      ? { provider: credentialProviderForCli(agentCli), source: 'platform' }
-      : null);
-  if (!binding) return null;
-  return issueAgentCredentialGrant(ssm, {
-    purpose,
-    projectId,
-    executionId,
-    bindings: [binding],
-  });
-};
+const issueInvocationAgentCredentialGrant = async (request) =>
+  (await prepareAgentInvocation({ ...request, legacyExecution: true }, { ssm }))
+    .agentCredentialGrant;
 
 // Finalizes a browser upload after S3 emits Object Created: verify it against
 // its DynamoDB reservation, copy the exact object version from staging to the
@@ -363,14 +331,10 @@ const ingestAttachmentUpload = async (event) => {
   }
 };
 const composeReportPrefix = (intentId) => `compose-reports/${intentId}/`;
-const runtimeSessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, '0');
-// Composer one-shots run in a THROWAWAY session keyed by the compose id —
-// stateless, so a fresh microVM (on the CURRENT image) per request is exactly
-// right; see the compose dispatch below for the field incident this avoids.
-const composeSessionIdFor = (composeId) => `aidlc-compose-${composeId}`.padEnd(33, '0');
-// Unit-lane session ids — must mirror v2-orchestrator/section.js laneSessionIdFor.
-const laneSessionIdFor = (intentId, sectionIndex, slug) =>
-  `aidlc-intent-${intentId}-s${sectionIndex}-${slug}`.padEnd(33, '0');
+// Session ids (main, compose, lane) come from shared/runtime-session-ids.js.
+// Composer one-shots run in a THROWAWAY session keyed by the compose id — see
+// the compose dispatch below for the field incident this avoids.
+const runtimeSessionIdFor = intentSessionIdFor;
 const invokeSourceControl = async (input) => {
   if (!SOURCE_CONTROL_FN()) {
     throw Object.assign(new Error('Source-control service is not configured'), {
@@ -491,18 +455,9 @@ const stopRuntimeSessions = async (
   for (const idx of sectionIndexes) {
     for (const slug of unitSlugs) ids.push(laneSessionIdFor(intentId, idx, slug));
   }
-  await mapWithConcurrency(ids, 8, async (id) => {
-    try {
-      await agentcore.send(
-        new StopRuntimeSessionCommand({
-          ...target,
-          runtimeSessionId: id,
-        }),
-      );
-    } catch (err) {
-      logger.warn('stop-runtime-session best-effort miss', err, { id });
-    }
-  });
+  // stop, not release: cancel/rewind/relaunch keep the workspace so the next
+  // launch re-attaches it — see the retention policy in shared/runtime-session.js.
+  await stopSessions({ client: agentcore, target, sessionIds: ids });
 };
 // SSM path of the Admin GLOBAL per-CLI model defaults (written by the agents
 // lambda's PUT /agents/settings). Merged UNDER the project selection at create so
@@ -1332,7 +1287,11 @@ const normalizeSource = (raw, trackers) => {
 
 // ── DTO assembly ──
 
-const CREDENTIAL_FAILURE_CODES = ['credential_unavailable', 'credential_invalid'];
+const CREDENTIAL_FAILURE_CODES = [
+  'credential_unavailable',
+  'credential_invalid',
+  'credential_quota_exhausted',
+];
 
 // New execution rows persist a structured failure. Older rows only have the
 // concatenated failureReason string, so normalize those once at the API
@@ -1407,12 +1366,17 @@ const mapIntent = (meta) => ({
   resumeRequired: meta.resumeRequired ?? null,
   agentCli: meta.agentCli ?? null,
   credentialSource: meta.credentialBinding?.source ?? null,
+  credentialConnection:
+    meta.status === 'DRAFT' && !meta.credentialBinding
+      ? null
+      : credentialBindingDisplay(meta.credentialBinding, meta.agentCli),
   cliModels: meta.cliModels ?? null,
   tierModels: meta.tierModels ?? null,
   environment: meta.environment ?? null,
   parkReleaseSeconds: meta.parkReleaseSeconds ?? null,
   maxParallelUnits: meta.maxParallelUnits ?? null,
   constructionAutonomyMode: meta.constructionAutonomyMode ?? null,
+  constructionGateAutonomy: meta.constructionGateAutonomy ?? null,
   prStrategy: meta.prStrategy ?? null,
   stageSkipping: meta.stageSkipping ?? null,
   skipStageIds: meta.skipStageIds ?? null,
@@ -2516,6 +2480,7 @@ export const handler = async (event, context) => {
             executionId: intentId,
             credentialBinding: records.meta.credentialBinding,
             agentCli: records.meta.agentCli,
+            runtimeCapabilities: records.meta.environment,
           });
           const res = await agentcore.send(
             new InvokeAgentRuntimeCommand({
@@ -2797,6 +2762,14 @@ export const handler = async (event, context) => {
             code: 'loop_back_status_invalid',
           });
         }
+        // The engine applies a grant on the parsed decision alone, so a row whose
+        // status says it was not approved must not carry one.
+        if (chosen === GRANT_AUTONOMY_OPTION && answerStatus !== 'approved') {
+          return response(400, {
+            error: 'A grant-autonomy answer must be recorded with status "approved"',
+            code: 'grant_autonomy_status_invalid',
+          });
+        }
       }
       // A loop-back is recordable ONLY on the gate the ENGINE offered it on, and
       // `loopBackTarget` is the only proof of that offer: `awaitEngineGate` writes it
@@ -2866,22 +2839,36 @@ export const handler = async (event, context) => {
         answer: data.answer ?? null,
         answeredBy: responder.sub,
         answeredByName: responder.displayName,
+        ifOrchestratorRunId: gate.orchestratorRunId ?? null,
+        ifStageCallbackId: gate.stageCallbackId ?? null,
+        stageInstanceId: gate.stageInstanceId ?? null,
       };
-      const answerResult = steeringMessage
-        ? await store.answerHumanTaskWithSteering({
-            ...answerInput,
-            steering: {
-              kind: 'gate-steer',
-              message: steeringMessage,
-              targetGateId: humanTaskId,
-              createdBy: responder.sub,
-              createdByName: responder.displayName,
-            },
-          })
-        : await store.answerHumanTask(answerInput);
-      const answered = steeringMessage
-        ? answerResult && { ...gate, ...answerResult.answered }
-        : answerResult;
+      let answerResult;
+      try {
+        answerResult = steeringMessage
+          ? await store.answerHumanTaskWithSteering({
+              ...answerInput,
+              steering: {
+                kind: 'gate-steer',
+                message: steeringMessage,
+                targetGateId: humanTaskId,
+                createdBy: responder.sub,
+                createdByName: responder.displayName,
+              },
+            })
+          : await store.answerHumanTask(answerInput);
+      } catch (error) {
+        // The answer transaction also checks META, which running workers write
+        // constantly. A conflict that outlasts the store's retries committed
+        // nothing, so the same answer can simply be sent again.
+        if (!isTransactionConflict(error)) throw error;
+        return response(409, {
+          error: 'The intent was busy saving other changes. Send the answer again.',
+          code: 'gate_answer_conflict',
+          retryable: true,
+        });
+      }
+      const answered = steeringMessage ? answerResult?.answered : answerResult;
       if (!answered) {
         return response(409, { error: 'Gate already answered or not pending' });
       }
@@ -2919,14 +2906,16 @@ export const handler = async (event, context) => {
       // older sibling gate just records the durable Q&A — the run is parked on a
       // different callback. SendDurableExecutionCallbackSuccess resumes the
       // EXISTING execution; a fresh Invoke would start a new one.
-      if (gate.callbackId) {
+      // Binding can finish after the initial GET. ALL_NEW from the answer CAS
+      // is the authoritative callback owner at the instant the answer commits.
+      if (answered.callbackId) {
         try {
-          await resumeDurableCallback(gate.callbackId, answered.answer);
+          await resumeDurableCallback(answered.callbackId, answered.answer);
           await (
             store.markGateCallbackConsumed?.({
               executionId: intentId,
               humanTaskId,
-              callbackId: gate.callbackId,
+              callbackId: answered.callbackId,
             }) ?? Promise.resolve()
           ).catch((markErr) =>
             logger.error('Gate callback consumption marker write failed', markErr),
@@ -2964,7 +2953,7 @@ export const handler = async (event, context) => {
               executionId: intentId,
               resumeRequired: {
                 humanTaskId,
-                callbackId: gate.callbackId,
+                callbackId: answered.callbackId,
                 answeredAt: answered.answeredAt ?? null,
               },
             })
@@ -3215,6 +3204,7 @@ export const handler = async (event, context) => {
           projectId,
           userId: sub,
           agentCli: selectedAgentCli,
+          runtimeCapabilities: meta.environment,
         });
         if (resolved.error) {
           return response(resolved.error.statusCode, resolved.error.body);
@@ -3376,6 +3366,10 @@ export const handler = async (event, context) => {
       // The run is over — free the warm microVM now instead of waiting for the
       // idle reap (the persistent mount survives for a later rewind relaunch).
       await stopRuntimeSessions(intentId, meta);
+      // Cancelling withdraws a construction autonomy grant, so a later rewind
+      // relaunches the intent gated. The grant's provenance keeps who gave it and
+      // gains who withdrew it. An intent without a grant writes nothing extra.
+      const revokesAutonomy = meta.constructionGateAutonomy === 'autonomous';
       const updated = await store.updateExecution({
         executionId: intentId,
         projectId,
@@ -3386,6 +3380,18 @@ export const handler = async (event, context) => {
         // A recorded answer whose callback failed is moot once the run ends.
         resumeRequired: null,
         completedAt: new Date().toISOString(),
+        ...(revokesAutonomy
+          ? {
+              constructionGateAutonomy: null,
+              constructionGateAutonomyGrant: {
+                ...meta.constructionGateAutonomyGrant,
+                revokedAt: new Date().toISOString(),
+                revokedBy: responder.sub,
+                revokedByName: responder.displayName || null,
+                revokedSource: 'cancel',
+              },
+            }
+          : {}),
       });
       await store
         .appendEvent({
@@ -3636,6 +3642,7 @@ export const handler = async (event, context) => {
           projectId,
           userId: sub,
           agentCli: requestedCli,
+          runtimeCapabilities: meta.environment,
         });
         if (resolved.error) {
           return response(resolved.error.statusCode, resolved.error.body);
@@ -3806,6 +3813,7 @@ export const handler = async (event, context) => {
           executionId: intentId,
           credentialBinding,
           agentCli: requestedCli,
+          runtimeCapabilities: meta.environment,
         });
         const res = await agentcore.send(
           new InvokeAgentRuntimeCommand({
@@ -4035,6 +4043,7 @@ export const handler = async (event, context) => {
           meta,
           yjsTable: process.env.YJS_DOCUMENTS_TABLE,
           agentcoreRuntimeTarget: runtimeTargetInput(meta, AGENTCORE_RUNTIME_ARN()),
+          sessionCleanupStore,
           artifactsBucket: ARTIFACTS_BUCKET(),
           actor: responder.displayName || responder.sub,
           force: false,
@@ -4044,6 +4053,17 @@ export const handler = async (event, context) => {
           return response(409, {
             error:
               'Intent is RUNNING, cannot delete — wait for it to park or finish, or cancel it first',
+          });
+        }
+        if (err instanceof SessionReleaseHandoffError) {
+          // Nothing was removed: the intent still owns its workspace sessions.
+          logger.error('Intent delete: workspace release could not be handed off', err, {
+            intentId,
+            sessionIds: err.sessionIds,
+          });
+          return response(503, {
+            error: 'Could not release the intent workspaces right now; nothing was deleted. Retry.',
+            code: err.code,
           });
         }
         throw err;
@@ -4097,6 +4117,7 @@ export const handler = async (event, context) => {
           executionId: intentId,
           credentialBinding: meta.credentialBinding,
           agentCli: meta.agentCli,
+          runtimeCapabilities: meta.environment,
         });
         const res = await agentcore.send(
           new InvokeAgentRuntimeCommand({
@@ -5404,6 +5425,27 @@ export const handler = async (event, context) => {
         typeof data.methodologyReleaseId === 'string' && data.methodologyReleaseId
           ? data.methodologyReleaseId
           : null;
+      // Construction Autonomy Mode, frozen onto the intent at create. The human
+      // typing this create request IS the grant, which is what upstream's
+      // human-presence guard exists to prove — so the field is accepted here and
+      // nowhere an unattended run could reach. Absent and null both leave the
+      // intent gated; a malformed value is a client bug, not an opt-out, because
+      // silently dropping it would run a gated intent while the caller believes
+      // it asked for autonomy.
+      if (
+        Object.hasOwn(data, 'constructionGateAutonomy') &&
+        data.constructionGateAutonomy !== null &&
+        !CONSTRUCTION_AUTONOMY_MODES.includes(data.constructionGateAutonomy)
+      ) {
+        return response(400, {
+          error: `constructionGateAutonomy must be one of ${CONSTRUCTION_AUTONOMY_MODES.join(', ')}, or null`,
+          code: 'construction_autonomy_mode_invalid',
+        });
+      }
+      // Only `autonomous` is a grant. `gated` is the default every intent already
+      // has, so it is stored as no grant and accepted on any release.
+      const requestedAutonomyMode =
+        data.constructionGateAutonomy === 'autonomous' ? 'autonomous' : null;
       if (requestedReleaseId && AIDLC_RELEASE_PINNING() !== 'on') {
         return response(400, {
           error: 'Per-intent AI-DLC release selection is disabled',
@@ -5587,6 +5629,11 @@ export const handler = async (event, context) => {
       }
       workflowVersion = planCheck.workflowVersion ?? workflowVersion;
       const planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
+      // The capability map of the plan the intent will actually run. Only a
+      // release-mode plan resolves one, which is exactly the boundary the autonomy
+      // grant needs: an unpinned intent has no authored protocol to honour.
+      // Re-stamped below if the deployment-ref auto-pin replaces this plan.
+      let resolvedCapabilities = planCheck.plan?.capabilities ?? null;
       let aidlcRepoRef = null;
       // A selected release IS the source of truth for the ref, so the network
       // lookup of the deployment ref is skipped: resolving an unrelated ref
@@ -5759,6 +5806,7 @@ export const handler = async (event, context) => {
             if (releasePlan.valid) {
               methodologyRelease = candidatePin;
               methodologyPins = releasePlan.methodologyPins;
+              resolvedCapabilities = releasePlan.plan?.capabilities ?? null;
               workflowVersion = releasePlan.workflowVersion ?? workflowVersion;
               if (skippedStableReleaseId) {
                 logger.info(
@@ -5879,6 +5927,21 @@ export const handler = async (event, context) => {
         if (error.code !== 'PR_STRATEGY_UNSUPPORTED') throw error;
         return response(409, { error: error.message, code: error.code });
       }
+      // Refuse the grant the resolved methodology cannot honour, before the
+      // execution exists. An unpinned intent, or a release whose closure ships no
+      // construction protocol, has no authored autonomy to reproduce — accepting
+      // the field there would persist a grant the gate walk ignores, which reads
+      // to the operator as autonomy that silently never happened.
+      if (
+        requestedAutonomyMode &&
+        !constructionAutonomyApplies({ capabilities: resolvedCapabilities ?? {} })
+      ) {
+        return response(400, {
+          error:
+            'constructionGateAutonomy needs an AI-DLC release whose methodology authors the construction autonomy protocol',
+          code: 'construction_autonomy_unavailable',
+        });
+      }
       const meta = await store.createExecution({
         executionId: newIntentId,
         projectId,
@@ -5908,6 +5971,15 @@ export const handler = async (event, context) => {
         parkReleaseSeconds: cfg.parkReleaseSeconds,
         maxParallelUnits: cfg.maxParallelUnits,
         prStrategy,
+        constructionGateAutonomy: requestedAutonomyMode,
+        constructionGateAutonomyGrant: requestedAutonomyMode
+          ? {
+              source: 'create',
+              grantedAt: new Date().toISOString(),
+              grantedBy: sub,
+              grantedByName: getResponder(event).displayName || null,
+            }
+          : null,
         stageSkipping,
         skipStageIds,
         composedGrid,
@@ -6420,6 +6492,7 @@ const mapFeedbackBatch = (batch) => ({
   requestedByName: batch.requestedByName ?? null,
   stageInstanceId: batch.stageInstanceId ?? null,
   output: batch.output ?? null,
+  changedFileProvenance: batch.changedFileProvenance ?? null,
   changedFiles: batch.changedFiles ?? null,
   verification: batch.verification ?? null,
   commitSha: batch.commitSha ?? null,

@@ -29,6 +29,8 @@ terraform {
 }
 
 provider "docker" {
+  # Private ECR push auth. Buildx source pulls instead read DOCKER_CONFIG, set
+  # by scripts/with-public-ecr-auth.mjs for both ARM64 and optional AMD64 builds.
   # Support for Podman via DOCKER_HOST environment variable (e.g., unix:///path/to/podman.sock)
   # If DOCKER_HOST is not set, defaults to the standard Docker socket
   registry_auth {
@@ -232,6 +234,46 @@ data "aws_ecr_image" "agentcore" {
   depends_on = [module.agentcore_docker_build]
 }
 
+# Optional amd64 build of the same core image. AgentCore microVMs are
+# arm64-only, but the Instances compute type also runs x86_64 — managed
+# environments targeting x86_64 instances need an amd64 core to build FROM.
+# Gated behind var.build_amd64_image so default installs pay no extra build.
+module "agentcore_docker_build_amd64" {
+  count = var.build_amd64_image ? 1 : 0
+
+  source  = "terraform-aws-modules/lambda/aws//modules/docker-build"
+  version = "~> 8.0"
+
+  # Same as the arm64 build: published core revisions pin this image by
+  # digest (amd64Image) and x86_64 environments build FROM it, so a rebuild
+  # must not delete the previous image from the repository.
+  keep_remotely   = true
+  create_ecr_repo = false
+  ecr_repo        = aws_ecr_repository.agentcore.name
+  ecr_address     = format("%v.dkr.ecr.%v.%v", data.aws_caller_identity.current.account_id, data.aws_region.current.region, local.dns_suffix)
+
+  use_image_tag    = true
+  image_tag        = "${local.agentcore_image_tag}-amd64"
+  source_path      = local.agentcore_source_path
+  docker_file_path = "${local.agentcore_source_path}/agentcore/Dockerfile"
+  platform         = "linux/amd64"
+  builder          = "default"
+  build_args       = var.docker_build_args
+
+  triggers = {
+    dir_sha = local.agentcore_files_sha
+  }
+}
+
+data "aws_ecr_image" "agentcore_amd64" {
+  count = var.build_amd64_image ? 1 : 0
+
+  repository_name = aws_ecr_repository.agentcore.name
+  image_tag       = "${local.agentcore_image_tag}-amd64"
+
+  depends_on = [module.agentcore_docker_build_amd64]
+}
+
 # ---------------------------------------------------------------------------
 # v2 process/state table (EXEC#/STAGE#/EVENT#/HUMAN#/METRIC#/OUTPUT#)
 #   GSI1 = project-status browse, GSI2 = per-execution type/state
@@ -246,6 +288,13 @@ resource "aws_dynamodb_table" "v2_executions" {
   read_capacity               = local.read_capacity
   write_capacity              = local.write_capacity
   deletion_protection_enabled = var.deletion_protection
+
+  # Only ephemeral authentication selection/invocation records set this field.
+  # Historical execution records are retained unchanged.
+  ttl {
+    attribute_name = "agentAuthTtl"
+    enabled        = true
+  }
 
   attribute {
     name = "pk"
@@ -390,6 +439,13 @@ resource "aws_iam_role_policy" "agentcore" {
             local.credential_broker_function_arn,
             local.source_control_function_arn,
           ]
+        },
+        {
+          # General runtime hardening: application credentials cannot assume another role.
+          # Credential acquisition belongs to the broker.
+          Effect   = "Deny"
+          Action   = ["sts:AssumeRole"]
+          Resource = "*"
         },
         {
           Effect   = "Allow"
@@ -682,6 +738,7 @@ resource "aws_security_group" "agentcore" {
 
 locals {
   runtime_environment_variables = {
+    AWS_SDK_UA_APP_ID             = var.aws_sdk_ua_app_id
     V2_WORKSPACE_DIR              = "/mnt/workspace"
     V2_PROCESS_TABLE              = aws_dynamodb_table.v2_executions.name
     BLOCKS_TABLE                  = var.blocks_table_name
@@ -703,6 +760,8 @@ locals {
 }
 
 resource "awscc_bedrockagentcore_runtime" "stage_executor" {
+  depends_on = [aws_iam_role_policy.agentcore]
+
   agent_runtime_name = replace("${var.project_name}_agentcore_${var.environment}", "-", "_")
   role_arn           = aws_iam_role.agentcore.arn
   # The container speaks the HTTP contract (POST /invocations + GET /ping on 8080).

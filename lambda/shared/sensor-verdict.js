@@ -49,6 +49,20 @@ const explains = (detail) =>
 const fileEntries = (detail) =>
   isRecord(detail) && Array.isArray(detail.files) ? detail.files.filter(isRecord) : [];
 
+// The runner groups a harness failure (`script-error` / `tool-unavailable`) out
+// of `files[]` into `harnessFailures[]`, keeping only the group's `reason`,
+// `result` and a bounded `sampleFiles`. When every failing file hit the same
+// harness problem that group is the only explanation there is, so normalize it
+// to the per-file shape rather than leave the verdict unexplained.
+const harnessEntries = (detail) =>
+  isRecord(detail) && Array.isArray(detail.harnessFailures)
+    ? detail.harnessFailures.filter(isRecord).map((group) => ({
+        file: Array.isArray(group.sampleFiles) ? group.sampleFiles[0] : null,
+        result: group.result,
+        detail: { reason: group.reason },
+      }))
+    : [];
+
 const text = (value) => {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -76,7 +90,9 @@ const resolveSensorVerdict = (verdict) => {
   const error = typeof top?.error === 'string' && top.error ? bounded(top.error) : null;
   // An entry that only says "nothing to inspect here" explains nothing, and one
   // that timed out silently ahead of the file that failed must not hide it.
-  const candidates = explains(top) ? [] : fileEntries(top).filter((row) => row.result !== 'PASS');
+  const candidates = explains(top)
+    ? []
+    : [...fileEntries(top), ...harnessEntries(top)].filter((row) => row.result !== 'PASS');
   const applicable = candidates.filter((row) => row.detail?.notApplicable !== true);
   const entry =
     applicable.find((row) => row.result === verdict?.result && text(row.detail?.reason)) ??

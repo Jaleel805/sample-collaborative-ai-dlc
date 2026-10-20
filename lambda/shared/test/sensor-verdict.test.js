@@ -220,3 +220,41 @@ describe('resolveSensorVerdict: bounds on a per-file reason', () => {
     expect(short('   ')).toBeNull();
   });
 });
+
+// The runner groups `script-error` / `tool-unavailable` out of `files[]` into
+// `harnessFailures[]`, so a sensor whose every file hit the same harness problem
+// has an EMPTY `files[]` and the only reason it gave sits on the group.
+describe('resolveSensorVerdict: a grouped harness failure', () => {
+  it('reads the group reason when files[] carries none', () => {
+    expect(
+      resolveSensorVerdict({
+        result: 'BLOCKED',
+        detail: {
+          harnessFailures: [
+            {
+              reason: 'tool-unavailable',
+              result: 'BLOCKED',
+              exitCode: 127,
+              fileCount: 3,
+              sampleFiles: ['src/a.ts', 'src/b.ts'],
+            },
+          ],
+        },
+      }),
+    ).toMatchObject({ file: 'src/a.ts', reason: 'src/a.ts: tool-unavailable' });
+  });
+
+  it("prefers the script's own per-file reason over a group", () => {
+    expect(
+      resolveSensorVerdict({
+        result: 'FAIL',
+        detail: {
+          harnessFailures: [
+            { reason: 'script-error', result: 'BLOCKED', fileCount: 1, sampleFiles: ['src/b.ts'] },
+          ],
+          files: [{ file: 'src/a.ts', result: 'FAIL', detail: { reason: '2 problems' } }],
+        },
+      }).reason,
+    ).toBe('src/a.ts: 2 problems');
+  });
+});

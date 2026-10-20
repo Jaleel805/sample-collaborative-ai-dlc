@@ -7,6 +7,7 @@ set -euo pipefail
 export AWS_PAGER=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_ARGS=("$@")
 TF_DIR="$SCRIPT_DIR/../terraform"
 ENVIRONMENT="dev"
 PHASE="all"
@@ -287,6 +288,13 @@ fi
 
 echo "Deploying environment: $ENVIRONMENT ($PHASE)"
 
+# Keep the token alive through apply (and refresh it for a separately saved plan).
+# The shared workflow also wraps older release scripts that predate this guard.
+if [[ "$PHASE" != "plan" && "${AIDLC_PUBLIC_ECR_AUTH_WRAPPED:-0}" != "1" ]]; then
+    exec node "$SCRIPT_DIR/with-public-ecr-auth.mjs" "$SCRIPT_DIR/.." -- \
+        bash "$SCRIPT_DIR/deploy-terraform.sh" ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
+fi
+
 if [[ "$PHASE" == "plan" || "$PHASE" == "all" ]]; then
     configure_docker_build_args
 
@@ -324,6 +332,16 @@ stop_retired_agent_tasks "$TFVARS_FILE"
 
 echo "Applying changes..."
 terraform apply "$PLAN_FILE"
+
+# All selection, execution and invocation writers are deployed before this
+# additive backfill. It also writes the readiness marker on fresh installations.
+# Initialization is idempotent and independent of the optional baseline reseed.
+echo "Initializing scoped agent authentication inventory..."
+INVENTORY_REGION="$(terraform output -raw aws_region)"
+INVENTORY_TABLE="$(terraform output -raw v2_executions_table_name)"
+AWS_REGION="$INVENTORY_REGION" V2_PROCESS_TABLE="$INVENTORY_TABLE" \
+    node "$SCRIPT_DIR/initialize-agent-auth-inventory.mjs"
+
 if [[ "${AIDLC_KEEP_PLAN:-0}" != "1" ]]; then
     rm -f "$PLAN_FILE"
 fi

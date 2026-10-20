@@ -86,6 +86,12 @@ describe('StageDetail', () => {
     const tooltip = chip.getAttribute('title');
     expect(tooltip).toBeTruthy();
     const explanation = tooltip!.split(' — ').at(-1)!;
-    expect(screen.getByRole('listitem')).toHaveTextContent(explanation);
+    // The drilldown now also renders the per-file diagnostics table, so pick the
+    // sensor-flag row rather than the only list item on the page.
+    const flag = screen
+      .getAllByRole('listitem')
+      .find((item) => item.textContent?.startsWith('type-check'));
+    expect(flag).toBeTruthy();
+    expect(flag!).toHaveTextContent(explanation);
   });
 });

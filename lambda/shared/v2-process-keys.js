@@ -236,12 +236,23 @@ const HUMAN_TASK_KINDS = ['approval', 'question', 'review-verdict', 'validation'
 const HUMAN_TASK_ANSWER_STATUSES = ['answered', 'approved', 'rejected'];
 const HUMAN_TASK_STATUSES = ['pending', ...HUMAN_TASK_ANSWER_STATUSES, 'superseded'];
 const isHumanTaskAnswerStatus = (status) => HUMAN_TASK_ANSWER_STATUSES.includes(status);
-// Stage + lane ownership for a human gate. sectionIndex is legacy-compatible:
-// older rows can omit it, so either side being null falls back to the exact
-// stageInstanceId + unitSlug match.
-const humanTaskMatchesOwner = ({ task, stageInstanceId, unitSlug = null, sectionIndex = null }) => {
-  if (!task || task.stageInstanceId !== stageInstanceId) return false;
-  if ((task.unitSlug ?? null) !== (unitSlug ?? null)) return false;
+// Stage + lane ownership for a human gate — the one rule for binding, park
+// exit and resume. The stage instance must match exactly (it already encodes
+// the unit and section). The gate's unitSlug and sectionIndex constrain only
+// when recorded: older bridges omitted them. `engineGates` also accepts a gate
+// that names no stage (batch/skeleton request-changes), which a resume
+// injects into every matching lane stage.
+const humanTaskMatchesOwner = ({
+  task,
+  stageInstanceId,
+  unitSlug = null,
+  sectionIndex = null,
+  engineGates = false,
+}) => {
+  if (!task) return false;
+  const taskStage = task.stageInstanceId ?? null;
+  if (taskStage !== (stageInstanceId ?? null) && !(engineGates && taskStage === null)) return false;
+  if (task.unitSlug != null && task.unitSlug !== (unitSlug ?? null)) return false;
   return (
     task.sectionIndex == null ||
     sectionIndex == null ||
@@ -313,9 +324,10 @@ const UNIT_PR_STATES = [
   'FAILED',
 ];
 const FEEDBACK_STATES = ['QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED'];
-// Construction autonomy ladder (rule 9): chosen once after the walking-skeleton
-// gate approves. `gated` = one approval gate per parallel batch; `autonomous` =
-// remaining lanes run without approval gates (failures still halt-and-ask).
+// The two-valued autonomy vocabulary, shared by the per-section unit-lane ladder
+// (`constructionAutonomyMode`) and the sequential construction-gate grant
+// (`constructionGateAutonomy`). Only the vocabulary is shared — each field's own
+// comment owns its semantics, and the two must never be written as one.
 const CONSTRUCTION_AUTONOMY_MODES = ['gated', 'autonomous'];
 // Quorum-supported artifact edit lifecycle (post-hoc document editing):
 //   PLANNING          — Quorum is analyzing downstream impact / drafting a plan
@@ -458,6 +470,19 @@ const buildExecutionMeta = ({
   // 'gated' (one approval gate per parallel batch). null until the ladder
   // prompt after the walking-skeleton gate is answered.
   constructionAutonomyMode = null,
+  // The human's grant for the SEQUENTIAL once-per-workflow construction stage
+  // gates: 'autonomous' waives them from the second non-skipped construction
+  // stage on, 'gated'/null gates every one. Deliberately NOT the field above:
+  // that one is the per-section unit-lane ladder's decision, whose prompt asks
+  // only about parallel lane batching, so honouring it here would waive gates
+  // the human was never asked about. Frozen at create, or set by the
+  // `grant-autonomy` answer at the first construction gate.
+  constructionGateAutonomy = null,
+  // Durable provenance of the grant above: who gave it, when, and through which
+  // door ('create' | 'gate'). On the row rather than only on a timeline event,
+  // because the event write is best-effort and an audit of who waived a human
+  // gate must not depend on it.
+  constructionGateAutonomyGrant = null,
   // Structured result of the always-run workspace-detection stage. Persisted
   // through a stage-scoped MCP tool so downstream consumers never need to
   // infer methodology context from repository presence or agent prose.
@@ -563,6 +588,9 @@ const buildExecutionMeta = ({
   maxParallelUnits,
   prStrategy,
   constructionAutonomyMode,
+  // Only a granted intent carries the grant, so every other row keeps exactly
+  // the attributes it always had.
+  ...(constructionGateAutonomy ? { constructionGateAutonomy, constructionGateAutonomyGrant } : {}),
   projectType,
   source,
   planWarnings,
@@ -1177,6 +1205,7 @@ const buildFeedbackBatchRow = ({
   requestedByName,
   stageInstanceId: null,
   output: null,
+  changedFileProvenance: null,
   changedFiles: null,
   verification: null,
   commitSha: null,

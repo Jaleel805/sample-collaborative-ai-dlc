@@ -151,7 +151,7 @@ describe('summarizeSensorDetail', () => {
       'FAIL',
     );
     expect(long).toHaveLength(500);
-    expect(long).toMatch(/^src\/a\.ts: e+…$/);
+    expect(long).toMatch(/^src\/a\.ts: e+… \[truncated\]$/);
     expect(
       summarizeSensorDetail(
         {
@@ -170,6 +170,42 @@ describe('summarizeSensorDetail', () => {
 
   it('returns null when nothing is worth showing', () => {
     expect(summarizeSensorDetail({ files: [{ file: 'src/a.ts', result: 'BLOCKED' }] })).toBeNull();
+  });
+
+  // The runner groups `script-error` / `tool-unavailable` out of `files[]`, so a
+  // sensor whose every file hit the same harness problem has an EMPTY `files[]`
+  // and the only reason it ever gave sits on the group.
+  it('reads the reason off a grouped harness failure when files[] has none', () => {
+    expect(
+      summarizeSensorDetail(
+        {
+          harnessFailures: [
+            {
+              reason: 'tool-unavailable',
+              result: 'BLOCKED',
+              exitCode: 127,
+              fileCount: 3,
+              sampleFiles: ['src/a.ts', 'src/b.ts'],
+            },
+          ],
+        },
+        'BLOCKED',
+      ),
+    ).toBe('src/a.ts: tool-unavailable');
+  });
+
+  it("prefers the script's own per-file reason over a harness group", () => {
+    expect(
+      summarizeSensorDetail(
+        {
+          harnessFailures: [
+            { reason: 'script-error', result: 'BLOCKED', fileCount: 1, sampleFiles: ['src/b.ts'] },
+          ],
+          files: [{ file: 'src/a.ts', result: 'FAIL', detail: { reason: '2 problems' } }],
+        },
+        'FAIL',
+      ),
+    ).toBe('src/a.ts: 2 problems');
   });
 });
 

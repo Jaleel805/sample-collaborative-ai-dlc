@@ -22,6 +22,8 @@
 export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze(['agent.max-turns@v1']);
 
 // The MCP server name we register under in mcp-config (see stage-materializer).
+import { BEDROCK_BACKEND } from './backend-adapters.js';
+
 export const MCP_SERVER_NAME = 'aidlc';
 
 // ── Claude Code (headless) ──
@@ -36,6 +38,22 @@ export const MCP_SERVER_NAME = 'aidlc';
 // stdin (verified: `echo … | claude -p`), so we pass `promptViaStdin: true` and
 // the spawn shell pipes it in (see cli/spawn.js). --input-format defaults to
 // "text", unaffected by the stream-json OUTPUT format.
+const cliPersistenceEnvironment = (cli, env) => {
+  if (cli === 'claude' && env.CLAUDE_CONFIG_DIR)
+    return { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR };
+  // Kiro's v2 sessions live under KIRO_HOME (default ~/.kiro), which
+  // cli/kiro-store.js syncs; the child must resolve the same directory.
+  if (cli === 'kiro') {
+    return {
+      ...(env.XDG_DATA_HOME ? { XDG_DATA_HOME: env.XDG_DATA_HOME } : {}),
+      ...(env.KIRO_HOME ? { KIRO_HOME: env.KIRO_HOME } : {}),
+    };
+  }
+  if (cli === 'opencode')
+    return { XDG_DATA_HOME: env.OPENCODE_XDG_DATA_HOME || '/home/node/.opencode-data' };
+  return {};
+};
+
 const claudeDriver = {
   name: 'claude',
   contextKey: 'mcpConfigPath',
@@ -83,6 +101,7 @@ const claudeDriver = {
   envForAuth(env) {
     const region = env.BEDROCK_REGION || env.AWS_REGION || 'us-east-1';
     const out = {
+      ...cliPersistenceEnvironment('claude', env),
       CLAUDE_CODE_USE_BEDROCK: '1',
       AWS_REGION: region,
       IS_SANDBOX: '1',
@@ -94,11 +113,18 @@ const claudeDriver = {
 };
 
 // ── Kiro CLI (headless) ──
-// `kiro-cli chat --no-interactive --trust-all-tools --agent <name>` — prompt
-// piped on STDIN. Kiro has NO `--mcp-config` flag (unlike Claude) — it discovers
-// MCP servers from an AGENT config at <cwd>/.kiro/agents/<name>.json (written by
-// the materializer) and is pointed at it with `--agent`. (Kiro reads the model
-// via --model.) API-key auth via env (KIRO_API_KEY).
+// `kiro-cli chat --no-interactive --trust-all-tools --agent-engine v2
+//  --output-format stream-json --agent <name>` — prompt piped on STDIN. Kiro has
+// NO `--mcp-config` flag (unlike Claude) — it discovers MCP servers from an AGENT
+// config at <cwd>/.kiro/agents/<name>.json (written by the materializer) and is
+// pointed at it with `--agent`. (Kiro reads the model via --model.) API-key auth
+// via env (KIRO_API_KEY).
+//
+// The engine is pinned because a Kiro release can change the default (2.19 ran
+// v1, 2.27 defaults to v2 and its help calls v2 "the pre-3.0 default"), and each
+// engine has its own session store and output. stream-json emits the run's ACP
+// events as JSONL (cli/kiro-parser.js): the session id, tool calls, errors and
+// per-turn credits, none of which the v2 text output reports.
 //
 // Prompt on STDIN, not argv: `kiro-cli chat` takes the prompt as a POSITIONAL
 // arg, and a large materialized prompt overflows ARG_MAX → spawn() throws
@@ -106,27 +132,40 @@ const claudeDriver = {
 // omitted, Kiro reads the prompt from stdin (verified: `echo … | kiro-cli chat
 // --no-interactive`), so we pass `promptViaStdin: true` and the spawn shell
 // pipes it in (see cli/spawn.js).
+const KIRO_CHAT_ARGS = [
+  'chat',
+  '--no-interactive',
+  '--trust-all-tools',
+  '--agent-engine',
+  'v2',
+  '--output-format',
+  'stream-json',
+];
+
 const kiroDriver = {
   name: 'kiro',
   contextKey: 'agentName',
   buildInvocation({ prompt, agentName, model }) {
-    const args = ['chat', '--no-interactive', '--trust-all-tools'];
+    const args = [...KIRO_CHAT_ARGS];
     if (agentName) args.push('--agent', agentName);
     if (model) args.push('--model', model);
     return { command: 'kiro-cli', args, env: {}, prompt, promptViaStdin: true };
   },
-  // Kiro has NO start-time session-id flag; the orchestrator captures the id after
-  // the fresh run (see buildListSessions / parseLatestKiroSession) and resumes by
-  // it. `--resume-id <id>` resolves the session regardless of cwd (verified).
+  // Kiro has NO start-time session-id flag; the runtime captures the id from the
+  // stream's first metadata event and resumes by it. `--resume-id <id>` resolves
+  // the session regardless of cwd (verified).
   // Answer piped on STDIN too, for the same ARG_MAX reason as the fresh run.
   buildResumeInvocation({ sessionId, answerMessage, agentName }) {
-    const args = ['chat', '--no-interactive', '--trust-all-tools'];
+    const args = [...KIRO_CHAT_ARGS];
     if (agentName) args.push('--agent', agentName);
     args.push('--resume-id', sessionId);
     return { command: 'kiro-cli', args, env: {}, prompt: answerMessage, promptViaStdin: true };
   },
   envForAuth(env) {
-    return env.KIRO_API_KEY ? { KIRO_API_KEY: env.KIRO_API_KEY } : {};
+    return {
+      ...cliPersistenceEnvironment('kiro', env),
+      ...(env.KIRO_API_KEY ? { KIRO_API_KEY: env.KIRO_API_KEY } : {}),
+    };
   },
 };
 
@@ -134,18 +173,12 @@ const kiroDriver = {
 // `opencode run --format json --auto --model amazon-bedrock/<id>` emits JSONL
 // and reads the prompt from stdin. OpenCode chooses the session id; the runtime
 // captures the first `sessionID` event and resumes it with `--session`.
-const openCodeModel = (model) => {
-  if (!model) return null;
-  const value = String(model);
-  return value.includes('/') ? value : `amazon-bedrock/${value}`;
-};
-
 const opencodeDriver = {
   name: 'opencode',
   contextKey: 'opencodeConfigContent',
-  buildInvocation({ prompt, model, opencodeConfigContent = null }) {
+  buildInvocation({ prompt, model, opencodeConfigContent = null, backend = BEDROCK_BACKEND }) {
     const args = ['run', '--format', 'json', '--auto'];
-    const resolvedModel = openCodeModel(model);
+    const resolvedModel = backend.model('opencode', model);
     if (resolvedModel) args.push('--model', resolvedModel);
     return {
       command: 'opencode',
@@ -155,9 +188,15 @@ const opencodeDriver = {
       promptViaStdin: true,
     };
   },
-  buildResumeInvocation({ sessionId, answerMessage, model, opencodeConfigContent = null }) {
+  buildResumeInvocation({
+    sessionId,
+    answerMessage,
+    model,
+    opencodeConfigContent = null,
+    backend = BEDROCK_BACKEND,
+  }) {
     const args = ['run', '--format', 'json', '--auto', '--session', sessionId];
-    const resolvedModel = openCodeModel(model);
+    const resolvedModel = backend.model('opencode', model);
     if (resolvedModel) args.push('--model', resolvedModel);
     return {
       command: 'opencode',
@@ -197,18 +236,11 @@ const opencodeDriver = {
 // default provider is the OpenAI-hosted API, which this deployment has no
 // credentials for — and headless exec must never wait on an approval prompt.
 // With a materialized home these duplicate config.toml with the same values.
-const CODEX_BASE_OVERRIDES = [
-  '-c',
-  'model_provider="amazon-bedrock"',
-  '-c',
-  'approval_policy="never"',
-];
-
 const codexDriver = {
   name: 'codex',
   contextKey: 'codexHome',
-  buildInvocation({ prompt, model, codexHome = null }) {
-    const args = ['exec', '--json', '--skip-git-repo-check', ...CODEX_BASE_OVERRIDES];
+  buildInvocation({ prompt, model, codexHome = null, backend = BEDROCK_BACKEND }) {
+    const args = ['exec', '--json', '--skip-git-repo-check', ...backend.codexOverrides];
     if (model) args.push('-m', model);
     args.push('-');
     return {
@@ -219,14 +251,20 @@ const codexDriver = {
       promptViaStdin: true,
     };
   },
-  buildResumeInvocation({ sessionId, answerMessage, model, codexHome = null }) {
+  buildResumeInvocation({
+    sessionId,
+    answerMessage,
+    model,
+    codexHome = null,
+    backend = BEDROCK_BACKEND,
+  }) {
     const args = [
       'exec',
       'resume',
       sessionId,
       '--json',
       '--skip-git-repo-check',
-      ...CODEX_BASE_OVERRIDES,
+      ...backend.codexOverrides,
     ];
     if (model) args.push('-m', model);
     args.push('-');
@@ -245,8 +283,8 @@ const codexDriver = {
   },
 };
 
-// The argv that lists Kiro's stored conversations as JSON. Run AFTER a fresh Kiro
-// stage exits to capture the id it created (Kiro can't be told the id up front).
+// The argv that lists Kiro's stored conversations as JSON. Run before a resume
+// to check the parked session can be loaded by the pinned engine.
 export const buildKiroListSessions = () => ({
   command: 'kiro-cli',
   args: ['chat', '--list-sessions', '--format', 'json'],
@@ -270,18 +308,6 @@ export const buildKiroUsage = () => ({
   command: 'kiro-cli',
   args: ['chat', '--no-interactive', '/usage'],
 });
-
-// Parse the per-request credit footer kiro-cli prints on STDERR after each
-// headless chat turn: ` ▸ Credits: 0.03 • Time: 2s`. The label and number are
-// plain text (ANSI color codes never split them), so a regex on the raw tail is
-// safe. Returns the LAST match (the footer of the final turn) as a number, or
-// null when absent/unparseable — callers treat null as "credits unknown".
-export const parseKiroCredits = (stderrTail = '') => {
-  const matches = [...String(stderrTail).matchAll(/Credits:\s*([\d.]+)/g)];
-  if (!matches.length) return null;
-  const n = Number(matches[matches.length - 1][1]);
-  return Number.isFinite(n) ? n : null;
-};
 
 // Parse the $/credit overage rate out of `/usage` output ("Overages: Enabled
 // billed at $0.04 per credit"). Returns a positive number or null — a missing
@@ -315,12 +341,13 @@ export const parseKiroModels = (stdout) => {
   return { models, default: parsed?.default_model ?? null };
 };
 
-// Parse `kiro-cli chat --list-sessions --format json` and return the newest
-// session id for `cwd` (newest by `updatedAt`). The output is keyed by cwd:
-//   [{ cwd, sessions: [{ sessionId, updatedAt, ... }] }]
-// Returns null when the stdout is unparseable or no session exists for the cwd —
-// the caller treats a null capture as "could not link" (resume then can't run).
-export const parseLatestKiroSession = (stdout, cwd) => {
+// Parse `kiro-cli chat --list-sessions --format json` and return the store
+// (`source`) holding `sessionId` under `cwd`. The output is keyed by cwd:
+//   [{ cwd, sessions: [{ sessionId, source, updatedAt, ... }] }]
+// `source` is "v2" for sessions the pinned v2 engine can resume and "classic"
+// for sessions written by Kiro <= 2.19 (v1 engine). Returns null when the stdout
+// is unparseable or the session is not listed.
+export const parseKiroSessionSource = (stdout, cwd, sessionId) => {
   let parsed;
   try {
     parsed = JSON.parse(stdout);
@@ -329,10 +356,8 @@ export const parseLatestKiroSession = (stdout, cwd) => {
   }
   const groups = Array.isArray(parsed) ? parsed : [];
   const group = cwd ? groups.find((g) => g?.cwd === cwd) : groups[0];
-  const sessions = group?.sessions ?? [];
-  if (!sessions.length) return null;
-  const newest = sessions.reduce((a, b) => ((b?.updatedAt ?? '') > (a?.updatedAt ?? '') ? b : a));
-  return newest?.sessionId ?? null;
+  const session = (group?.sessions ?? []).find((s) => s?.sessionId === sessionId);
+  return session ? String(session.source ?? '') : null;
 };
 
 export const DRIVERS = {
@@ -345,10 +370,33 @@ export const DRIVERS = {
 // CLIs the runtime can drive, in stable preference order.
 export const SUPPORTED_CLIS = ['claude', 'kiro', 'opencode', 'codex'];
 
-export const getDriver = (cli) => {
+export const getDriver = (cli, { backend = BEDROCK_BACKEND } = {}) => {
   const d = DRIVERS[cli];
   if (!d) throw new Error(`unsupported CLI "${cli}" (have: ${SUPPORTED_CLIS.join(', ')})`);
-  return d;
+  if (backend === BEDROCK_BACKEND || cli === 'kiro') return d;
+  const prepare = (input) => {
+    if (cli !== 'opencode') return { ...input, backend };
+    const configuration = input.opencodeConfigContent
+      ? JSON.parse(input.opencodeConfigContent)
+      : {};
+    return {
+      ...input,
+      backend,
+      opencodeConfigContent: JSON.stringify({
+        ...configuration,
+        provider: { ...configuration.provider, ...backend.opencodeConfiguration?.provider },
+      }),
+    };
+  };
+  return {
+    ...d,
+    buildInvocation: (input) => d.buildInvocation(prepare(input)),
+    buildResumeInvocation: (input) => d.buildResumeInvocation(prepare(input)),
+    envForAuth: (env) => ({
+      ...cliPersistenceEnvironment(cli, env),
+      ...backend.envForAuth(cli, env),
+    }),
+  };
 };
 
 // Pick the CLI to drive a stage. An EXPLICIT request is honoured strictly: if the

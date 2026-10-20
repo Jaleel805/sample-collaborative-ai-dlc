@@ -71,7 +71,11 @@ import {
 // IntentActivityPanel where output/timeline/discussions render).
 
 const TERMINAL_STATUSES = new Set(['FAILED', 'CANCELLED', 'SUCCEEDED']);
-const CREDENTIAL_FAILURE_CODES = new Set(['credential_unavailable', 'credential_invalid']);
+const CREDENTIAL_FAILURE_CODES = new Set([
+  'credential_unavailable',
+  'credential_invalid',
+  'credential_quota_exhausted',
+]);
 const NON_EXPORTABLE_STATUSES = new Set(['DRAFT', 'CREATED']);
 const EXPORT_HARNESSES: Array<{ value: NativeExportHarness; label: string }> = [
   { value: 'claude', label: 'Claude' },
@@ -417,6 +421,15 @@ export default function IntentView() {
             </Badge>
           )}
           <MethodologyReleaseBadge release={intent.methodologyRelease ?? null} />
+          {intent.constructionGateAutonomy === 'autonomous' && (
+            <Badge
+              variant="outline"
+              className="text-[10px] shrink-0"
+              data-testid="construction-autonomy-badge"
+            >
+              Autonomous construction
+            </Badge>
+          )}
           {isActive && (
             <span
               className="h-1.5 w-1.5 rounded-full bg-agent-running animate-pulse shrink-0"

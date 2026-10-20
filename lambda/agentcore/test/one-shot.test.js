@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOneShotPrompt, parseClaudeOneShot, extractJsonObject } from '../cli/one-shot.js';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Fake child factory for captureChild: emits the given stdout/stderr then closes.
 // `stdin.end` records the piped prompt so tests can assert it goes on stdin (not
@@ -56,6 +60,11 @@ describe('extractJsonObject', () => {
     expect(extractJsonObject('[1,2]')).toBeNull();
   });
 });
+
+const kiroStream = (...events) =>
+  events
+    .map(([type, data]) => JSON.stringify({ type, data: { sessionId: 'k-1', ...data } }))
+    .join('\n');
 
 describe('runOneShotPrompt', () => {
   it('returns no_cli when nothing usable is installed', async () => {
@@ -126,13 +135,33 @@ describe('runOneShotPrompt', () => {
     );
   });
 
-  it('runs kiro, strips ANSI from stdout, and captures the credit footer', async () => {
+  it('runs kiro on stream-json and parses the answer and credits', async () => {
     let argv;
     const spawnFn = vi.fn((command, args) => {
       argv = { command, args };
       return fakeChild({
-        stdout: '\u001B[38;5;141mThe answer\u001B[0m {"gist":"k"}',
-        stderr: ' ▸ Credits: 0.12 • Time: 1s',
+        stdout: kiroStream(
+          [
+            'sessionUpdate',
+            {
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'The answer ' },
+              },
+            },
+          ],
+          [
+            'sessionUpdate',
+            {
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: '{"gist":"k"}' },
+              },
+            },
+          ],
+          ['metadata', { meteringUsage: [{ value: 0.12, unit: 'credit', unitPlural: 'credits' }] }],
+          ['runFinished', { status: 'success', finalText: 'The answer {"gist":"k"}' }],
+        ),
       });
     });
     const restoreKiroStore = vi.fn(async () => true);
@@ -147,12 +176,12 @@ describe('runOneShotPrompt', () => {
     });
     expect(out.ok).toBe(true);
     expect(out.cli).toBe('kiro');
-    expect(out.text).toContain('{"gist":"k"}');
-    expect(out.text).not.toContain('\u001B');
+    expect(out.text).toBe('The answer {"gist":"k"}');
     expect(out.metrics).toEqual({ credits: 0.12 });
+    expect(argv.args).toContain('stream-json');
     expect(argv.args).toContain('--agent');
     expect(argv.args[argv.args.indexOf('--agent') + 1]).toBe('aidlc');
-    // Kiro's SQLite store is bracketed exactly like resolve-conflict.
+    // Kiro's store is bracketed exactly like resolve-conflict.
     expect(restoreKiroStore).toHaveBeenCalledOnce();
     expect(persistKiroStore).toHaveBeenCalledOnce();
   });
@@ -285,11 +314,171 @@ describe('runOneShotPrompt', () => {
     expect(out.sample).toContain('boom: credentials missing');
   });
 
+  describe('Kiro non-zero exit diagnostic', () => {
+    const throttled =
+      'Internal error (code -32603): Encountered an error in the response stream: ThrottlingException: Too many requests, please wait before trying again.';
+    const chunk = (text) => [
+      'sessionUpdate',
+      {
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+      },
+    ];
+    // Real v2 shape: metadata and message chunks precede the terminal runError,
+    // pushing it well past the bounded sample.
+    const earlyEvents = [
+      ['runStarted', { payloadSchema: 'acp', acpProtocolVersion: 1, engine: 'v2' }],
+      ['metadata', { contextUsagePercentage: 3.58 }],
+      chunk('Reading the discussion thread before drafting the summary. '),
+      chunk('The thread covers the release checklist and the rollout plan. '),
+      ['metadata', { contextUsagePercentage: 4.12, turnDurationMs: 812 }],
+    ];
+    const runOneShotKiro = (stdout) =>
+      runOneShotPrompt({
+        prompt: 'p',
+        availableClis: ['kiro'],
+        spawnFn: vi.fn(() => fakeChild({ exitCode: 1, stdout })),
+        restoreKiroStore: async () => true,
+        persistKiroStore: async () => true,
+      });
+
+    it('samples the structured runError even when earlier events fill the bound', async () => {
+      const stdout = kiroStream(...earlyEvents, [
+        'runError',
+        { stage: 'prompt', message: throttled },
+      ]);
+      expect(stdout.indexOf('ThrottlingException')).toBeGreaterThan(300);
+      const out = await runOneShotKiro(stdout);
+      expect(out).toMatchObject({ ok: false, reason: 'cli_failed', cli: 'kiro', exitCode: 1 });
+      expect(out.sample).toContain('ThrottlingException: Too many requests');
+      expect(out.sample.length).toBeLessThanOrEqual(300);
+    });
+
+    it('falls back to the raw output when no structured error is present', async () => {
+      const unstructured = await runOneShotKiro(`fatal: ${'x'.repeat(400)}`);
+      expect(unstructured.sample).toBe(`fatal: ${'x'.repeat(293)}`);
+      // Events without a runError (e.g. a crash mid-stream) keep the raw prefix.
+      const truncated = kiroStream(...earlyEvents);
+      const noError = await runOneShotKiro(truncated);
+      expect(noError).toMatchObject({ ok: false, reason: 'cli_failed' });
+      expect(noError.sample).toBe(truncated.slice(0, 300));
+    });
+
+    it('still classifies a late credential runError without returning provider output', async () => {
+      const out = await runOneShotKiro(
+        kiroStream(...earlyEvents, [
+          'runError',
+          {
+            stage: 'prompt',
+            message:
+              'Internal error (code -32603): Encountered an error in the response stream: The bearer token included in the request is invalid.',
+          },
+        ]),
+      );
+      expect(out).toMatchObject({ ok: false, reason: 'credential_invalid', exitCode: 1 });
+      expect(out).not.toHaveProperty('sample');
+    });
+
+    it('leaves the non-Kiro sample on the raw output prefix', async () => {
+      const stdout = `${'{"type":"turn.started"}\n'.repeat(20)}{"type":"error","message":"late codex failure"}`;
+      const out = await runOneShotPrompt({
+        prompt: 'p',
+        availableClis: ['codex'],
+        spawnFn: vi.fn(() => fakeChild({ exitCode: 1, stdout })),
+        cleanupCodexHome: async () => true,
+      });
+      expect(out).toMatchObject({ ok: false, reason: 'cli_failed', cli: 'codex' });
+      expect(out.sample).toBe(stdout.slice(0, 300));
+    });
+  });
+
+  it('creates a fresh working directory before launching a real child', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'one-shot-cwd-'));
+    const cwd = join(root, 'fresh', 'invocation');
+    try {
+      const result = await runOneShotPrompt({
+        prompt: 'fixture',
+        availableClis: ['claude'],
+        cwd,
+        env: {},
+        spawnFn: (_command, _args, options) =>
+          spawn(
+            process.execPath,
+            ['-e', 'console.log(JSON.stringify({type:"result",result:process.cwd()}))'],
+            options,
+          ),
+      });
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain('/fresh/invocation');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('maps a working directory that cannot be created to cli_failed before any CLI state is touched', async () => {
+    const makeDirectory = vi.fn(async () => {
+      throw Object.assign(new Error('read-only file system'), { code: 'EROFS' });
+    });
+    const spawnFn = vi.fn();
+    const restoreKiroStore = vi.fn(async () => true);
+    const persistKiroStore = vi.fn(async () => true);
+    const out = await runOneShotPrompt({
+      prompt: 'p',
+      availableClis: ['kiro'],
+      cliModels: { kiro: 'auto' },
+      cwd: '/tmp/compose/i1',
+      spawnFn,
+      makeDirectory,
+      restoreKiroStore,
+      persistKiroStore,
+    });
+    expect(out).toEqual({
+      ok: false,
+      reason: 'cli_failed',
+      text: '',
+      cli: 'kiro',
+      model: 'auto',
+      exitCode: null,
+      metrics: null,
+    });
+    expect(makeDirectory).toHaveBeenCalledWith('/tmp/compose/i1', { recursive: true });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(restoreKiroStore).not.toHaveBeenCalled();
+    expect(persistKiroStore).not.toHaveBeenCalled();
+  });
+
+  it('still removes the caller-materialized Codex home when the working directory fails', async () => {
+    const cleanupCodexHome = vi.fn(async () => true);
+    const spawnFn = vi.fn();
+    const env = { AWS_REGION: 'us-east-1' };
+    const out = await runOneShotPrompt({
+      prompt: 'p',
+      availableClis: ['codex'],
+      codexHome: '/ws/.aidlc/codex-home',
+      env,
+      spawnFn,
+      cleanupCodexHome,
+      makeDirectory: async () => {
+        throw new Error('no space left on device');
+      },
+    });
+    expect(out).toMatchObject({ ok: false, reason: 'cli_failed', cli: 'codex', exitCode: null });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(cleanupCodexHome).toHaveBeenCalledWith({ codexHome: '/ws/.aidlc/codex-home', env });
+  });
+
   it('maps rejected credentials to credential_invalid without returning provider output', async () => {
+    // Kiro's v2 engine reports a rejected key as a runError on stdout only.
     const spawnFn = vi.fn(() =>
       fakeChild({
         exitCode: 1,
-        stderr: 'HTTP 403 Forbidden: bearer token rejected secret-value',
+        stdout: kiroStream([
+          'runError',
+          {
+            stage: 'prompt',
+            message:
+              'Internal error (code -32603): Encountered an error in the response stream: The bearer token included in the request is invalid. secret-value',
+          },
+        ]),
       }),
     );
     const out = await runOneShotPrompt({
