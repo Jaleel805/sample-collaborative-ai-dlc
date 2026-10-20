@@ -105,26 +105,31 @@ export function useCollaborativeIntentDraft(
     aidlcSettings: null,
   });
   const seededRef = useRef(false);
-  // Sticky: has this draft ever had a per-intent setting? A release that
-  // authors none never puts a key in the map, so this stays false and the save
-  // body omits `aidlcSettings` entirely — which is the request every pre-2.11
-  // draft already sends, byte for byte. It latches on the first key seen from
-  // any source (the seed, this member, a peer) so clearing the LAST override
-  // still sends `null` and still clears the stored one.
-  const hadSettingsRef = useRef(false);
+  // Sticky, PER DOCUMENT: has this draft ever had a per-intent setting? A
+  // release that authors none never puts a key in the map, so this stays false
+  // and the save body omits `aidlcSettings` entirely — which is the request
+  // every pre-2.11 draft already sends, byte for byte. It latches on the first
+  // key seen from any source (the seed, this member, a peer) so clearing the
+  // LAST override still sends `null` and still clears the stored one.
+  //
+  // Keyed by the document because a save OUTLIVES it: the revision read is
+  // awaited before the payload is taken, so a retiring draft's save can read
+  // this after the page has moved to another draft. A single flag would then
+  // answer for the document now on screen and drop the retiring document's
+  // settings — or its explicit `null` — from its own final PATCH.
+  const hadSettingsRef = useRef(new WeakMap<Y.Doc, boolean>());
   const [hydratedDoc, setHydratedDoc] = useState<Y.Doc | null>(null);
 
   useEffect(() => {
     if (!doc) return;
     seededRef.current = false;
-    hadSettingsRef.current = false;
     const titleText = doc.getText('title');
     const promptText = doc.getText('prompt');
     const config = doc.getMap('config');
     const settings = doc.getMap(AIDLC_SETTINGS_MAP);
     const update = () => {
       const aidlcSettings = readAidlcSettings(doc);
-      if (aidlcSettings) hadSettingsRef.current = true;
+      if (aidlcSettings) hadSettingsRef.current.set(doc, true);
       setState({
         title: titleText.toString(),
         prompt: promptText.toString(),
@@ -392,7 +397,7 @@ export function useCollaborativeIntentDraft(
       // one without the other. OMITTED for a draft that has never had a
       // setting, so an unpinned, 2.3.3, 2.8.2 or 2.9.0 draft keeps sending
       // exactly the body it sent before these settings existed.
-      ...(hadSettingsRef.current ? { aidlcSettings: readAidlcSettings(doc) } : {}),
+      ...(hadSettingsRef.current.get(doc) ? { aidlcSettings: readAidlcSettings(doc) } : {}),
     };
   }, [doc, synced, intentId]);
 

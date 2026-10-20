@@ -26,8 +26,10 @@ const api = vi.hoisted(() => ({
 
 vi.mock('../services/intents', () => ({ intentsService: api }));
 vi.mock('./useYjsDocument', () => ({
-  useYjsDocument: (_id: string, name: string) => {
-    const peer = transport.peers.get(name)!;
+  useYjsDocument: (id: string, name: string) => {
+    // A member who navigates between drafts registers one peer per document
+    // id; a member who stays on one draft registers a single peer by name.
+    const peer = (transport.peers.get(`${name}/${id}`) ?? transport.peers.get(name))!;
     const [localRevision, setRevision] = useState(0);
     useEffect(() => {
       const changed = (_update: Uint8Array, _origin: unknown, _doc: Y.Doc, tx: Y.Transaction) => {
@@ -320,6 +322,143 @@ describe('useCollaborativeIntentDraft — pruning the settings a selection drops
 
     expect(dropped.toSorted()).toEqual(['collaborators', 'guardPolicy']);
     expect(a.result.current.aidlcSettings).toBeNull();
+  });
+});
+
+// A save belongs to the document it read, and that document can retire while
+// its request is still in flight: the revision read is awaited before the
+// payload is taken. Navigating to another draft must therefore not change how
+// the earlier save serializes ITS document — the settings-presence state that
+// decides whether `aidlcSettings` is in the body is owned by that document, not
+// by whichever draft the page happens to show when the response lands.
+describe('useCollaborativeIntentDraft — a save that outlives its document', () => {
+  const deferred = () => {
+    let release!: (value: { draftRevision: number }) => void;
+    const promise = new Promise<{ draftRevision: number }>((resolve) => {
+      release = resolve;
+    });
+    return { promise, release: () => release({ draftRevision: 7 }) };
+  };
+
+  // One hook instance, two real documents, navigated by changing the intent id
+  // exactly as the router does.
+  const navigating = (ids: string[]) => {
+    const docs = new Map<string, Y.Doc>();
+    for (const id of ids) {
+      const peer = { doc: new Y.Doc(), flushDocument: vi.fn().mockResolvedValue(undefined) };
+      transport.peers.set(`Alice/intent-draft-${id}`, peer);
+      docs.set(id, peer.doc);
+    }
+    const hook = renderHook(
+      ({ intentId }: { intentId: string }) => useCollaborativeIntentDraft('p1', intentId, 'Alice'),
+      { initialProps: { intentId: ids[0] } },
+    );
+    return { ...hook, docs };
+  };
+
+  const bodyFor = (intentId: string) =>
+    api.update.mock.calls.filter((call) => call[1] === intentId).at(-1)?.[2];
+
+  // `guardPolicy=strict` on A, A's revision read delayed, navigate to B which
+  // has no settings at all, then release A's response.
+  it('sends the retiring document’s own settings after navigation', async () => {
+    const first = deferred();
+    api.draftEditState.mockImplementation((_projectId: string, intentId: string) =>
+      intentId === 'A' ? first.promise : Promise.resolve({ draftRevision: 3 }),
+    );
+    const page = navigating(['A', 'B']);
+
+    act(() => {
+      page.result.current.initFromIntent(intent({ id: 'A' }));
+    });
+    act(() => {
+      page.result.current.setAidlcSetting('guardPolicy', 'strict');
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    page.rerender({ intentId: 'B' });
+    act(() => {
+      page.result.current.initFromIntent(intent({ id: 'B', scope: 'bugfix' }));
+    });
+    await act(async () => {
+      first.release();
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    expect(bodyFor('A')).toMatchObject({
+      title: 'An intent',
+      prompt: 'Build X',
+      scope: 'classic',
+      aidlcSettings: { guardPolicy: 'strict' },
+      ifDraftRevision: 7,
+    });
+    expect(page.result.current.aidlcSettings).toBeNull();
+    expect(bodyFor('B')).toBeUndefined();
+  });
+
+  // Clearing the LAST override needs the same ownership: the retiring document
+  // has an empty map, so only its own sticky presence state can still send the
+  // explicit `null` that clears the stored settings.
+  it('sends an explicit null for a cleared override after navigation', async () => {
+    const first = deferred();
+    api.draftEditState.mockImplementation((_projectId: string, intentId: string) =>
+      intentId === 'A' ? first.promise : Promise.resolve({ draftRevision: 3 }),
+    );
+    const page = navigating(['A', 'B']);
+
+    act(() => {
+      page.result.current.initFromIntent(
+        intent({ id: 'A', aidlcSettings: { guardPolicy: 'strict' } }),
+      );
+    });
+    act(() => {
+      page.result.current.setAidlcSetting('guardPolicy', null);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    page.rerender({ intentId: 'B' });
+    act(() => {
+      page.result.current.initFromIntent(intent({ id: 'B', scope: 'bugfix' }));
+    });
+    await act(async () => {
+      first.release();
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    const body = bodyFor('A');
+    expect(body).toHaveProperty('aidlcSettings');
+    expect(body!.aidlcSettings).toBeNull();
+    expect(page.result.current.scope).toBe('bugfix');
+    expect(bodyFor('B')).toBeUndefined();
+  });
+
+  // B is a draft with no settings, so ITS save keeps the pre-2.11 body even
+  // though the draft the member came from had one.
+  it('keeps the next document’s own request shape', async () => {
+    api.draftEditState.mockResolvedValue({ draftRevision: 3 });
+    const page = navigating(['A', 'B']);
+
+    act(() => {
+      page.result.current.initFromIntent(
+        intent({ id: 'A', aidlcSettings: { guardPolicy: 'strict' } }),
+      );
+    });
+    page.rerender({ intentId: 'B' });
+    act(() => {
+      page.result.current.initFromIntent(intent({ id: 'B', scope: 'bugfix' }));
+    });
+    act(() => {
+      page.result.current.setTitle('Renamed');
+    });
+    await act(async () => {
+      await page.result.current.flushDraft();
+    });
+
+    expect(bodyFor('B')).not.toHaveProperty('aidlcSettings');
   });
 });
 
