@@ -207,12 +207,19 @@ const MODE_TASKS = {
   ].join('\n'),
 };
 
-// The composer persona and its knowledge are upstream methodology text and can
-// be large (the 2.6.18+ persona alone is ~46-48 KB); everything after them is
-// what the platform needs the model to act on. When the whole prompt fits, it is
-// joined in order. When it does not, the persona and knowledge are cut to the
-// space the rest leaves, so the task, the intent, the grounding and the output
-// contract reach the model. The mode task and the output contract are never cut.
+// Two sections of a compose prompt can be large and are only context: the
+// composer persona with its knowledge (upstream methodology text; the 2.6.18+
+// persona alone is ~46-48 KB) and a report excerpt of up to MAX_REPORT_EXCERPT.
+// Everything else is what the model must act on: the engine-command annex, the
+// execution-environment note, the mode task, the intent, the grounding (every
+// stock scope's run shape and the complete stage catalog) and the output
+// contract that demands a grid covering that catalog.
+//
+// When the whole prompt fits, it is joined in order. When it does not, the
+// required sections are kept whole and the two large sections share the space
+// they leave, each cut with a marker, so a catalog row is never lost to them.
+// Only when the required sections alone exceed the limit is the text before the
+// output contract cut at the limit.
 //
 // From 2.8.2 the persona invokes the upstream engine as `{{INVOKE}} engine …`,
 // and it addresses the local harness through `{{HARNESS_DIR}}`. Neither exists
@@ -222,6 +229,8 @@ const MODE_TASKS = {
 // Ends a cut persona, so the model knows the methodology text above is partial.
 export const COMPOSER_PERSONA_TRUNCATED =
   '[Composer persona and knowledge truncated here to fit the prompt budget.]';
+// Ends a cut report excerpt, for the same reason.
+export const REPORT_EXCERPT_TRUNCATED = '[Report excerpt truncated here to fit the prompt budget.]';
 
 // The upstream composer persona is written for the local AI-DLC harness: it
 // runs `detect`/`validate-grid`, writes proposal files, and must STOP when those
@@ -238,6 +247,8 @@ const PLATFORM_ENVIRONMENT = [
   '- When no workspace signals are attached, the project type (greenfield/brownfield) is unknown: say so in the rationale and prefer a shape that is correct either way.',
   '- Unavailable harness tools are never a reason to answer with mode "failed". Use "failed" only when neither a stock scope nor a custom grid can be justified from the intent and the grounding.',
 ].join('\n');
+
+const joinSections = (texts) => texts.join('\n\n');
 
 const buildComposePrompt = ({
   mode,
@@ -263,43 +274,73 @@ const buildComposePrompt = ({
         'You are the AI-DLC composer agent: you propose workflow projections; you never route, advance, gate, or write workflow state.',
     ),
     knowledge ? neutralizeTokens(knowledge) : null,
-  ].filter(Boolean);
-  const tail = [
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+  const report = reportExcerpt
+    ? `Report excerpt:\n${String(reportExcerpt).slice(0, MAX_REPORT_EXCERPT)}`
+    : null;
+  const sections = [
+    { text: head, marker: COMPOSER_PERSONA_TRUNCATED },
     // The composer runs ONE-SHOT with no MCP configuration, so the annex it
     // receives is the tool-less form: every answer whose channel is a platform
     // tool is rewritten onto the proposal it returns, and it raises no
     // checkpoint. Appending the raw annex told a promoted fork's composer to
     // call tools its own session does not have.
     hasInvokeToken(persona, knowledge)
-      ? invokeDialectAnnex({
-          toolless: true,
-          checkpointLogInvoked: invokesCheckpointLog(persona, knowledge),
-        })
+      ? {
+          text: invokeDialectAnnex({
+            toolless: true,
+            checkpointLogInvoked: invokesCheckpointLog(persona, knowledge),
+          }),
+        }
       : null,
-    PLATFORM_ENVIRONMENT,
-    MODE_TASKS[mode],
-    `Intent:\n${intentPrompt || '(none provided)'}`,
-    instructions ? `Requester instructions:\n${instructions}` : null,
+    { text: PLATFORM_ENVIRONMENT },
+    { text: MODE_TASKS[mode] },
+    { text: `Intent:\n${intentPrompt || '(none provided)'}` },
+    instructions ? { text: `Requester instructions:\n${instructions}` } : null,
     repoSignals
-      ? `Workspace signals (advisory — runtime detection is authoritative):\n${JSON.stringify(repoSignals, null, 2)}`
+      ? {
+          text: `Workspace signals (advisory — runtime detection is authoritative):\n${JSON.stringify(repoSignals, null, 2)}`,
+        }
       : null,
-    reportExcerpt ? `Report excerpt:\n${String(reportExcerpt).slice(0, MAX_REPORT_EXCERPT)}` : null,
-    progressContext ? `Live stage progress:\n${progressContext}` : null,
-    grounding,
-  ]
-    .filter(Boolean)
-    .map(String);
-  const whole = [...head, ...tail, contract].join('\n\n');
+    report ? { text: report, marker: REPORT_EXCERPT_TRUNCATED } : null,
+    progressContext ? { text: `Live stage progress:\n${progressContext}` } : null,
+    grounding ? { text: String(grounding) } : null,
+    { text: contract },
+  ].filter(Boolean);
+  const whole = joinSections(sections.map(({ text }) => text));
   if (whole.length <= CONTEXT_LIMIT) return whole;
-  // The output contract is appended whole after the cut. If the rest still does
-  // not fit once the persona and knowledge are gone, its end (the grounding) is
-  // cut too; the mode task comes first in it, so it stays.
-  const budget = CONTEXT_LIMIT - contract.length - 2;
-  const rest = tail.join('\n\n');
-  const room = Math.max(0, budget - rest.length - COMPOSER_PERSONA_TRUNCATED.length - 3);
-  const body = [`${head.join('\n\n').slice(0, room)}\n${COMPOSER_PERSONA_TRUNCATED}`, rest]
-    .join('\n\n')
-    .slice(0, budget);
+
+  // Space left for the two bounded sections once every required section and
+  // every separator is counted. They split it evenly, and a section that needs
+  // less than its half gives the rest to the other.
+  const bounded = sections.filter(({ marker }) => marker);
+  const fixed = whole.length - bounded.reduce((sum, { text }) => sum + text.length, 0);
+  const room = Math.max(0, CONTEXT_LIMIT - fixed);
+  const [first, second] = bounded;
+  const share = new Map();
+  if (second) {
+    const half = Math.floor(room / 2);
+    const firstShare = Math.max(half, room - second.text.length);
+    share.set(first, Math.min(first.text.length, firstShare));
+    share.set(second, room - share.get(first));
+  } else if (first) {
+    share.set(first, room);
+  }
+  const cut = (section) => {
+    const limit = share.get(section);
+    if (limit === undefined || section.text.length <= limit) return section.text;
+    return `${section.text.slice(0, Math.max(0, limit - section.marker.length - 1))}\n${section.marker}`;
+  };
+  const budgeted = joinSections(sections.map(cut));
+  if (budgeted.length <= CONTEXT_LIMIT) return budgeted;
+  // The required sections alone do not fit: keep the output contract whole and
+  // cut what precedes it at the limit.
+  const body = joinSections(sections.slice(0, -1).map(cut)).slice(
+    0,
+    CONTEXT_LIMIT - contract.length - 2,
+  );
   return `${body}\n\n${contract}`;
 };
 
@@ -605,6 +646,9 @@ export const createComposePlanStart = ({
 };
 
 export {
+  CONTEXT_LIMIT as COMPOSE_CONTEXT_LIMIT,
+  MAX_REPORT_EXCERPT,
+  PLATFORM_ENVIRONMENT,
   buildScopeGrounding,
   settingsScopeFor,
   validateProposal,
