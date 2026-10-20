@@ -19,6 +19,11 @@
 //   handler             field-level runtime seam id (see RUNTIME_HANDLERS).
 //   values              per-authored-value { handling, handler }. Present ⇒ the
 //                       keys ARE the closed enum for this field.
+//   authoredType        the typeof the PARSED frontmatter value, 'string' unless
+//                       stated. The enum keys are always text, so a field whose
+//                       YAML value is a boolean declares it here and the
+//                       analyzer compares the real type rather than assuming a
+//                       string (aidlc-compatibility.js).
 //   defaultWhenAbsent   release-mode value applied when the field is ABSENT and
 //                       `capabilityPresentIf` holds. null = inert when absent
 //                       (the default rule for every field).
@@ -48,7 +53,11 @@ const RUNTIME_HANDLERS = Object.freeze(
     'policy.review-cap@v1',
     'policy.sensors@v1',
     'policy.change-control@v1',
+    'policy.collaborators.off@v1',
+    'policy.guard-policy.off@v1',
     'policy.learnings.off@v1',
+    'policy.plan-approval.switch@v1',
+    'policy.project-type.default@v1',
     'policy.learnings.ritual@v1',
     'policy.skeleton.switch@v1',
     'policy.summary-confirmation.off@v1',
@@ -70,6 +79,48 @@ const RUNTIME_HANDLERS = Object.freeze(
 // A value the platform does not reproduce names no seam. Spelled once so the
 // invariant check below reads as the rule it enforces.
 const UNHANDLED = Object.freeze({ handling: 'unsupported', handler: null });
+
+// A `{{INVOKE}} engine <family>` gap is not an authored frontmatter value and
+// never reaches `plan.capabilities`: it is prompt text, and the seam that answers
+// it is the engine-command annex the stage and compose prompts append
+// (agentcore/prompts/invoke-dialect-annex.md). The annex is a CLOSED list, so a
+// family it names BY NAME has a defined platform answer — for a state-mutating
+// family, recording a recommendation for the human instead of performing the
+// action — and must not block promotion where the annex reaches the prompt (the
+// gap carries `annexed` only then). A family the annex does not name gets
+// only its catch-all ("say it is unavailable, never improvise"), which keeps the
+// authored step unperformed and unrecorded, so it keeps blocking promotion.
+//
+// This is deliberately NOT the same axis as the fidelity report, which keeps
+// classifying these families `unsupported`: that is the admin-facing statement
+// "the platform does not reproduce these semantics", not "this build has no
+// handler". `release_capability_unhandled` means the latter.
+const ANNEX_HANDLED_ENGINE_COMMANDS = Object.freeze(
+  new Set(['engine graph ars', 'engine orchestrate', 'engine recompose', 'engine state']),
+);
+
+const ENGINE_COMMAND_GAP_FIELD = '{{INVOKE}}';
+const isEngineCommandGap = (gap) =>
+  gap?.blockType === 'BODY' && gap?.field === ENGINE_COMMAND_GAP_FIELD;
+
+// An authored field no entry below covers has no legal values, no handler and no
+// absent-default — the platform does not know what it means, so a release that
+// authors one would run with a setting silently dropped. The analyzer already
+// withholds certification for it (`certificationGaps`); promotion reads the same
+// names off the closure (`compatibility.executionRelevantUnmappedFields`) through
+// this constructor, so one list produces both answers. `unhonouredValues` treats
+// this value as unconditionally unhonoured: it is a statement about what the
+// importer DROPPED, which no later handler can recover.
+const UNMAPPED_FIELD_GAP_VALUE = 'unmapped';
+const unmappedFieldGaps = (executionRelevantUnmappedFields = []) =>
+  executionRelevantUnmappedFields.map((key) => {
+    const separator = String(key).indexOf(':');
+    return {
+      blockType: String(key).slice(0, separator),
+      field: String(key).slice(separator + 1),
+      value: UNMAPPED_FIELD_GAP_VALUE,
+    };
+  });
 
 // The version-agnostic marker for the stages Plan Approval governs — see
 // `planApprovalApplies`.
@@ -301,6 +352,9 @@ const AIDLC_CAPABILITIES = Object.freeze([
     values: Object.freeze({
       strict: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
       relaxed: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
+      // 2.11's third value, reaching this key through `guard_policy`: no reopen
+      // and no change-control prose, which is exactly "no change control".
+      off: Object.freeze({ handling: 'approximated', handler: 'policy.guard-policy.off@v1' }),
     }),
     // Upstream treats an omitted `change_control` as `strict`. Defaulting it
     // unconditionally would inject a change-control ritual into 2.6.18/2.7.0,
@@ -310,6 +364,95 @@ const AIDLC_CAPABILITIES = Object.freeze([
     defaultWhenAbsent: 'strict',
     capabilityPresentIf: 'anyBlockAuthorsField',
     note: 'A stage approval records the content fingerprints of what it produced; the next stage compares its required inputs against them BEFORE the agent runs. `relaxed` appends a deduplicated v2.change.accepted and continues; `strict` opens a two-option question gate (reconfirm / stop and rewind) whose halt is a rewind-eligible failure. Classified `approximated`, not `native`: this reproduces only the input-fingerprint half of upstream\u2019s mechanism \u2014 compare-before-run plus the strict/relaxed gate. Upstream\u2019s reviewer-request and completion-refusal halves (a reviewer that can itself request re-confirmation, and a human that can refuse the completion outright on a changed input) are not reproduced. Residual: an input no approval ever recorded has no fingerprint to differ from and is therefore not reported as changed.',
+  }),
+  // 2.11 renames `change_control` to `guard_policy` and adds an `off` value, and
+  // adds `plan_approval`, `collaborators` and `existing_code`. The importer maps
+  // all four onto the SCOPE block, so the analyzer stops calling them unmapped —
+  // and an authored value must therefore have SOMETHING here to judge it, or
+  // mapping alone would silently open promotion for a setting the runtime still
+  // drops. Each is classified `unsupported` with no handler until the PR that
+  // resolves it onto the per-stage policy flips the classification and names its
+  // seam. The enum is the real contribution of these entries meanwhile: an
+  // illegal value is refused at import instead of reaching the plan.
+  Object.freeze({
+    key: 'SCOPE:guard_policy',
+    blockType: 'SCOPE',
+    field: 'guard_policy',
+    planKey: 'guardPolicy',
+    policy: 'scope',
+    handling: 'approximated',
+    handler: 'policy.change-control@v1',
+    values: Object.freeze({
+      strict: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
+      relaxed: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
+      off: Object.freeze({ handling: 'approximated', handler: 'policy.guard-policy.off@v1' }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: 'Upstream\u2019s rename of `change_control`, with a third value `off`. The plan resolves ONE effective guard value from this field first and the legacy name second, so a scope carrying only the new name \u2014 which a user SCOPE overlay can, because an overlay never passes through the mapper \u2014 is honoured, and a 2.8.2/2.9.0 closure resolves exactly as before. `strict` and `relaxed` are the change-control gate unchanged. `off` is a removal the platform performs natively \u2014 no reopen and no change-control prose \u2014 but stays `approximated` because upstream\u2019s `off` ALSO lowers execution fences (pre-write guards, hook trust) this platform never had, and supports per-fence `Guards Off`/`Guards On` overrides with a provenance and kill-switch chain that have no surface here. The platform sentence is exact: Guard Policy off means no change-control reopen; it never removes a human approval gate.',
+  }),
+  Object.freeze({
+    key: 'SCOPE:plan_approval',
+    blockType: 'SCOPE',
+    field: 'plan_approval',
+    planKey: 'planApproval',
+    policy: 'scope',
+    handling: 'approximated',
+    handler: 'protocol.plan-approval.outcome-gate@v1',
+    values: Object.freeze({
+      on: Object.freeze({
+        handling: 'approximated',
+        handler: 'protocol.plan-approval.outcome-gate@v1',
+      }),
+      off: Object.freeze({ handling: 'approximated', handler: 'policy.plan-approval.switch@v1' }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: '`off` sets `policy.planApproval` to null: `request_plan_approval` is not registered for the stage and the completion ladder requires no plan receipt. It changes NOTHING else \u2014 the stage\u2019s `humanValidation` is untouched, which the plan suite asserts for every scope and stage. `on` keeps the existing approximation (A07): the platform checks the outcome rather than guarding each write. Refused and named in the annex: upstream\u2019s engine-owned three-choice ask, its fingerprint/receipt minting, `--units` subsets, edit-while-waiting protection and strict-reopen-on-change.',
+  }),
+  // Upstream's collaborator switch, resolved onto the ensemble topology by this
+  // PR. `on` is the platform's existing per-persona session approximation; `off`
+  // withdraws the support roster so the lead alone produces the declared outputs.
+  Object.freeze({
+    key: 'SCOPE:collaborators',
+    blockType: 'SCOPE',
+    field: 'collaborators',
+    planKey: 'collaborators',
+    policy: 'scope',
+    handling: 'approximated',
+    handler: 'stage.mode.ensemble-sessions@v1',
+    values: Object.freeze({
+      on: Object.freeze({
+        handling: 'approximated',
+        handler: 'stage.mode.ensemble-sessions@v1',
+      }),
+      off: Object.freeze({ handling: 'native', handler: 'policy.collaborators.off@v1' }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: '`off` resolves no ensemble topology at all, which is this runtime\u2019s existing single-session contract: the lead agent produces every declared stage output itself, with no pipeline link, no mob round and no support brief. That is upstream\u2019s own lead-only contract, so `off` is honoured natively. Each withdrawn persona is named on the plan\u2019s policy effects, so the downgrade reaches the timeline instead of being a silently shorter roster. `on` keeps the existing approximation (A02): the support personas get real separate blind sessions and their contributions are graph artifacts, not an engine-owned collaboration ledger.',
+  }),
+  // The one authored setting that is a YAML BOOLEAN rather than a string, which
+  // is why the entry declares its authored type: the enum check at the analyzer
+  // boundary compares the real parsed value, so upstream\u2019s `existing_code: true`
+  // imports and a quoted `"true"` \u2014 which would reach the prompt renderer as a
+  // string and be dropped \u2014 is refused.
+  Object.freeze({
+    key: 'SCOPE:existing_code',
+    blockType: 'SCOPE',
+    field: 'existing_code',
+    planKey: 'existingCode',
+    policy: 'scope',
+    authoredType: 'boolean',
+    handling: 'approximated',
+    handler: 'policy.project-type.default@v1',
+    values: Object.freeze({
+      true: Object.freeze({ handling: 'approximated', handler: 'policy.project-type.default@v1' }),
+      false: Object.freeze({ handling: 'approximated', handler: 'policy.project-type.default@v1' }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: 'The authored value reaches `policy.existingCode` and the stage prompt states the project type it implies, so the scope\u2019s own classification steers the run instead of being dropped. `approximated`, not native: upstream additionally rescans, reintroduces Reverse Engineering behind the cursor and returns to the interrupted stage when the type changes mid-run. That transaction is refused by name in the annex (`engine orchestrate next`) \u2014 a human rewinds and recomposes.',
   }),
   Object.freeze({
     key: 'SCOPE:learnings',
@@ -511,23 +654,100 @@ const FRONTMATTER_ENUMS = Object.freeze(
   ),
 );
 
-// The plan's policy vocabulary: [owner, planKey, authored field, allowed values].
-// Scope-owned rows first, then stage-owned, so a catalog with several invalid
-// policy values reports them in the order the pre-registry table did.
+// The typeof each enum field's PARSED frontmatter value. Derived from the same
+// entries, so the analyzer can never disagree with the registry about whether a
+// field is authored as text or as a YAML boolean.
+const FRONTMATTER_ENUM_TYPES = Object.freeze(
+  Object.fromEntries(
+    Object.keys(FRONTMATTER_ENUMS).map((blockType) => [
+      blockType,
+      Object.freeze(
+        Object.fromEntries(
+          AIDLC_CAPABILITIES.filter((entry) => entry.blockType === blockType && entry.values).map(
+            (entry) => [entry.field, entry.authoredType ?? 'string'],
+          ),
+        ),
+      ),
+    ]),
+  ),
+);
+
+const isHandled = (entry) => entry.handling !== 'unsupported';
+
+// The plan's policy vocabulary: [owner, planKey, authored field, allowed values,
+// authored type, uninterpreted values]. Scope-owned rows first, then
+// stage-owned, so a catalog with several invalid policy values reports them in
+// the order the pre-registry table did. The authored type rides along because
+// the plan boundary also sees blocks the import analyzer never judged (a user
+// SCOPE overlay is stored verbatim), so it must check the parsed type against
+// the same single declaration.
+//
+// The last member is the subset of the field's own legal values whose handling
+// is still `unsupported`, and it is only ever nonempty for a field that HAS a
+// consumer: a fully unsupported field activates no policy at all, so none of its
+// values reaches a handler, while a handled field's unsupported value reaches
+// one that implements no branch for it.
+const uninterpretedValues = (entry) =>
+  Object.freeze(
+    isHandled(entry)
+      ? Object.entries(entry.values)
+          .filter(([, value]) => value?.handling === 'unsupported')
+          .map(([name]) => name)
+      : [],
+  );
 const policyRows = (owner) =>
   AIDLC_CAPABILITIES.filter((entry) => entry.policy === owner && entry.values).map((entry) =>
-    Object.freeze([owner, entry.planKey, entry.field, Object.keys(entry.values)]),
+    Object.freeze([
+      owner,
+      entry.planKey,
+      entry.field,
+      Object.keys(entry.values),
+      entry.authoredType ?? 'string',
+      uninterpretedValues(entry),
+    ]),
   );
 const POLICY_ENUMS = Object.freeze([...policyRows('scope'), ...policyRows('stage')]);
 
-const policyKeys = (owner) =>
+// Two different questions, two different lists.
+//
+// `*_POLICY_KEYS` is the vocabulary the plan KNOWS: every policy field the
+// registry names, so an authored value of any of them is type- and enum-checked
+// even before a handler exists.
+//
+// `*_RUNTIME_POLICY_KEYS` is the subset whose handling is no longer
+// `unsupported` — the fields that actually have a consumer. Only those may
+// ACTIVATE a resolved `stage.policy`, because activation also switches on every
+// other policy key's default (change control, loop-back, the review lattice) and
+// is the enablement gate the ensemble topology reads. A field that is merely
+// mapped-and-validated must leave the plan exactly as policy-free as it was
+// before its entry existed, or classifying it would ship its neighbours' effects
+// to a release whose own setting is still dropped.
+const policyKeys = (owner, predicate = () => true) =>
   Object.freeze(
-    AIDLC_CAPABILITIES.filter((entry) => entry.policy === owner && entry.planKey).map(
-      (entry) => entry.planKey,
-    ),
+    AIDLC_CAPABILITIES.filter(
+      (entry) => entry.policy === owner && entry.planKey && predicate(entry),
+    ).map((entry) => entry.planKey),
   );
 const SCOPE_POLICY_KEYS = policyKeys('scope');
 const STAGE_POLICY_KEYS = policyKeys('stage');
+const SCOPE_RUNTIME_POLICY_KEYS = policyKeys('scope', isHandled);
+const STAGE_RUNTIME_POLICY_KEYS = policyKeys('stage', isHandled);
+
+// The point query of the fact the policy rows carry per field: is THIS authored
+// value of THIS policy field one the platform has no interpretation for? The
+// plan refuses such a value from a user overlay, and the runtime consumer of a
+// field with several outcomes asks again before acting — so a value that
+// reached a `stage.policy` by another route still cannot run as one of the
+// outcomes it is not.
+const POLICY_VALUES_UNINTERPRETED = Object.freeze(
+  Object.fromEntries(
+    POLICY_ENUMS.filter(([, , , , , uninterpreted]) => uninterpreted.length > 0).map(
+      ([, planKey, , , , uninterpreted]) => [planKey, uninterpreted],
+    ),
+  ),
+);
+const policyValueUninterpreted = (planKey, value) =>
+  value != null && (POLICY_VALUES_UNINTERPRETED[planKey] ?? []).includes(String(value));
 
 // ── Capability presence ─────────────────────────────────────────────────────
 // Version-agnostic presence tests over the resolved release catalog. Evaluated
@@ -645,8 +865,20 @@ const unhonouredValues = ({
   fidelityGaps = [],
   registry = AIDLC_CAPABILITIES,
   handlers = RUNTIME_HANDLERS,
+  annexedEngineCommands = ANNEX_HANDLED_ENGINE_COMMANDS,
 } = {}) =>
   fidelityGaps.filter((gap) => {
+    if (isEngineCommandGap(gap)) {
+      return !(gap.annexed === true && annexedEngineCommands.has(gap.value));
+    }
+    // An `unmapped` gap records that the IMPORTER of that closure stored no
+    // value for the field — the information is gone from the catalog, not merely
+    // unhandled by this build. A later build adding a handler cannot recover it,
+    // so the gap can only be cleared by re-importing the source under the newer
+    // revision (`upgradeReleaseClosure`). Were it matched against the registry
+    // like an authored value, adding an entry would clear an old closure's
+    // blocker and promote it as though it carried the setting.
+    if (gap.value === UNMAPPED_FIELD_GAP_VALUE) return true;
     const entry = registry.find(
       (candidate) => candidate.blockType === gap.blockType && candidate.field === gap.field,
     );
@@ -684,42 +916,56 @@ const planApprovalApplies = ({ stage, capabilities = {} } = {}) => {
 
 export {
   AIDLC_CAPABILITIES,
+  ANNEX_HANDLED_ENGINE_COMMANDS,
   FIELD_FIDELITY,
   FRONTMATTER_ENUMS,
+  FRONTMATTER_ENUM_TYPES,
   LOOP_BACK_RESULTS_ARTIFACT,
   PLAN_APPROVAL_ARTIFACT,
   POLICY_ENUMS,
   QUESTION_CHANNEL_OUTPUT_SUFFIX,
   RUNTIME_HANDLERS,
   SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
+  UNMAPPED_FIELD_GAP_VALUE,
   capabilityFor,
   defaultWhenAbsent,
   isQuestionChannelOutput,
   planApprovalApplies,
+  policyValueUninterpreted,
   protocolCapabilitiesFromEvidence,
   resolveCapabilities,
   unhandledCapabilities,
   unhonouredValues,
+  unmappedFieldGaps,
 };
 
 export default {
   AIDLC_CAPABILITIES,
+  ANNEX_HANDLED_ENGINE_COMMANDS,
   FIELD_FIDELITY,
   FRONTMATTER_ENUMS,
+  FRONTMATTER_ENUM_TYPES,
   LOOP_BACK_RESULTS_ARTIFACT,
   PLAN_APPROVAL_ARTIFACT,
   POLICY_ENUMS,
   QUESTION_CHANNEL_OUTPUT_SUFFIX,
   RUNTIME_HANDLERS,
   SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
+  UNMAPPED_FIELD_GAP_VALUE,
   capabilityFor,
   defaultWhenAbsent,
   isQuestionChannelOutput,
   planApprovalApplies,
+  policyValueUninterpreted,
   protocolCapabilitiesFromEvidence,
   resolveCapabilities,
   unhandledCapabilities,
   unhonouredValues,
+  unmappedFieldGaps,
 };

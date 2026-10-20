@@ -4,9 +4,18 @@
 // catalog without the new fields must produce byte-identical output.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { ANNEX_HANDLED_ENGINE_COMMANDS } from '../../shared/aidlc-capabilities.js';
+import {
+  INVOKE_FAMILY_FIDELITY,
+  filesFromCompatibilityFixture,
+} from '../../shared/aidlc-compatibility.js';
+import { buildReleaseBundle } from '../../shared/aidlc-release.js';
+import { annexReachingBlocks } from '../../shared/annex-reach.js';
+import { COMPOSER_AGENT_ID } from '../../shared/compose-match.js';
 import { createSensorRunner } from '../sensor-runner.js';
 import {
   INVOKE_DIALECT_ANNEX,
@@ -16,6 +25,9 @@ import {
   neutralizeInvoke,
   renderScopePolicy,
 } from '../stage-materializer.js';
+import { buildComposePrompt } from '../commands/compose-plan-start.js';
+import { composePersonaPrompt } from '../persona-dispatch.js';
+import { __test as runStageInternals } from '../commands/run-stage.js';
 import { workspaceRelativePath } from '../repo-paths.js';
 
 const STAGE = Object.freeze({
@@ -69,17 +81,37 @@ describe('{{INVOKE}} dialect', () => {
     expect(prompt).not.toContain('{{INVOKE}}');
   });
 
-  it('does not append the annex for incidental mentions in other prompt parts', () => {
-    for (const part of ['agentPersona', 'knowledge', 'compiledContext']) {
+  // A release authors the persona and the reference knowledge to INSTRUCT the
+  // agent just as it authors the stage body: the promotion guard counts an
+  // engine command found in one of those bodies as answered, so the prompt that
+  // renders it has to carry the answer. The compose prompt already gates on the
+  // composer persona and its knowledge (commands/compose-plan-start.js); a stage
+  // prompt renders the same kinds of body and gates on them the same way.
+  it('appends the annex when the persona or the reference knowledge instructs', () => {
+    for (const part of ['agentPersona', 'knowledge']) {
       const prompt = buildStagePrompt({
         stage: STAGE,
         stageBody: 'plain',
-        [part]: 'Historically this ran {{INVOKE}} engine gen scope-table.',
+        [part]: 'Obtain the branch with `{{INVOKE}} engine worktree info --slug current`.',
       });
-      expect(prompt).not.toContain(INVOKE_DIALECT_ANNEX);
-      expect(prompt).not.toContain('{{INVOKE}}');
-      expect(prompt).toContain('<runtime-managed-engine>');
+      expect(prompt, part).toContain(INVOKE_DIALECT_ANNEX);
+      expect(prompt, part).not.toContain('{{INVOKE}}');
+      expect(prompt, part).toContain('<runtime-managed-engine> engine worktree info');
     }
+  });
+
+  // The compiled context is runtime data the platform assembles, never authored
+  // release content, so it is not evidence the guard reads and gating on it
+  // would append the annex for an incidental quote.
+  it('does not append the annex for an incidental mention in the compiled context', () => {
+    const prompt = buildStagePrompt({
+      stage: STAGE,
+      stageBody: 'plain',
+      compiledContext: 'Historically this ran {{INVOKE}} engine gen scope-table.',
+    });
+    expect(prompt).not.toContain(INVOKE_DIALECT_ANNEX);
+    expect(prompt).not.toContain('{{INVOKE}}');
+    expect(prompt).toContain('<runtime-managed-engine>');
   });
 
   it('never tells the agent a missing prerequisite is satisfied', () => {
@@ -123,6 +155,51 @@ describe('{{INVOKE}} dialect', () => {
     expect(INVOKE_DIALECT_ANNEX).toContain('emit_stage_note');
     expect(INVOKE_DIALECT_ANNEX).toContain('send_output');
   });
+
+  // The promotion guard stops refusing a release for the families this annex
+  // answers, so the two must not drift: a family dropped from the annex list
+  // must stop being honoured, and a newly honoured family must be answered here.
+  it('answers by name every engine-command family the promotion guard honours', () => {
+    expect([...ANNEX_HANDLED_ENGINE_COMMANDS]).toContain('engine graph ars');
+    for (const command of ANNEX_HANDLED_ENGINE_COMMANDS) {
+      expect(INVOKE_DIALECT_ANNEX).toContain(`${command} `);
+    }
+  });
+
+  // The composer persona of 2.8.2 and 2.9.0 runs `workspace detect`; the compose
+  // prompt carries the platform's workspace signals instead.
+  it('answers workspace detect from the workspace signals the compose prompt carries', () => {
+    const row = INVOKE_DIALECT_ANNEX.split('\n').find((line) =>
+      line.startsWith('- `engine workspace detect'),
+    );
+    expect(row).toContain('Workspace signals');
+  });
+
+  // Only a for_each stage runs in a per-unit lane; every other stage, such as
+  // the pipeline and deployment stages whose agent invokes `worktree`, runs on
+  // the intent branch.
+  it('says which branch the working tree is on, in a lane and outside one', () => {
+    const row = INVOKE_DIALECT_ANNEX.split('\n').find((line) =>
+      line.startsWith('- `engine worktree create`'),
+    );
+    expect(row).toContain('In a per-unit lane your working tree is that unit');
+    expect(row).toContain('otherwise it is the intent branch itself');
+  });
+
+  // A family classified `approximated` is no gap at all, so the annex is the only
+  // place the agent learns what the platform does instead.
+  it('answers by name every engine-command family classified approximated', () => {
+    const approximated = INVOKE_FAMILY_FIDELITY.filter(
+      (entry) => entry.handling === 'approximated',
+    ).map((entry) => entry.family);
+
+    expect(approximated).toEqual(
+      expect.arrayContaining(['gen', 'workspace', 'worktree', 'graph validate-grid']),
+    );
+    for (const family of approximated) {
+      expect(INVOKE_DIALECT_ANNEX, family).toContain(`engine ${family}`);
+    }
+  });
 });
 
 describe('scope policy in the stage prompt', () => {
@@ -145,6 +222,28 @@ describe('scope policy in the stage prompt', () => {
     const rendered = renderScopePolicy({ ...POLICY, planApproval: 'required' });
     expect(rendered).toContain('Plan approval is REQUIRED');
     expect(rendered).toContain('request_plan_approval');
+  });
+
+  // The registry declares `SCOPE:existing_code` handled by a seam in this
+  // module, so the prompt must actually state the project type. Without this,
+  // removing the whole block leaves the plan and registry suites green and the
+  // "handled" claim is a comment.
+  it('states the brownfield project type an existing-code scope authors', () => {
+    const rendered = renderScopePolicy({ ...POLICY, existingCode: true });
+
+    expect(rendered).toContain('Project type: BROWNFIELD');
+    expect(
+      buildStagePrompt({
+        stage: { ...STAGE, policy: { ...POLICY, existingCode: true } },
+        stageBody: 'x',
+      }),
+    ).toContain('Project type: BROWNFIELD');
+  });
+
+  it('says nothing about the project type when the scope does not author it', () => {
+    for (const existingCode of [null, false]) {
+      expect(renderScopePolicy({ ...POLICY, existingCode })).not.toContain('Project type');
+    }
   });
 
   it('says nothing about learnings when the scope turns them off', () => {
@@ -353,5 +452,161 @@ describe('sensor fire_on planes', () => {
     expect(verdict.detail.artifacts).toEqual([
       { artifact: 'business-logic-model', reason: 'not found in graph' },
     ]);
+  });
+});
+
+// `annex-reach.js` is a claim the PROMPT BUILDERS have to honour: the promotion
+// guard stops blocking an engine command found in one of these blocks, so every
+// session the runtime renders that block into must receive the answer. The
+// builders and the guard share one module, but sharing a set is not the same as
+// delivering it — a builder could gate on a part this set does not name, or stop
+// gating on one it does. So rather than restate the rule, each case below walks
+// the blocks of a REAL catalog and asserts the REAL prompt of each session that
+// renders the block.
+describe('annex reach, against the prompts the runtime really builds', () => {
+  const PROFILE = 'v2.9.0';
+  const { catalog } = buildReleaseBundle({
+    profileId: PROFILE,
+    files: filesFromCompatibilityFixture({
+      profileId: PROFILE,
+      fixture: JSON.parse(
+        readFileSync(
+          new URL(
+            `../../shared/test/fixtures/aidlc-compatibility/${PROFILE}.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      ),
+    }),
+  });
+  const TOKEN_BODY = 'Run `{{INVOKE}} engine state practices-event --type x`.';
+  const STAGES = catalog.blocks.STAGE;
+  // These are CATALOG blocks (`block-mappers.js` `mapStage`), whose shape is
+  // `supportAgents` and a `reviewer` STRING naming the reviewing agent — not the
+  // resolved plan's `supportAgentRefs` / `reviewer.reviewerAgent`. Reading the
+  // plan's field names here leaves both sets empty and silently reduces the
+  // whole check to lead sessions, so the enumeration is pinned below.
+  const LEAD_AGENTS = new Set(STAGES.map((stage) => stage.leadAgent).filter(Boolean));
+  const SUPPORT_AGENTS = new Set(STAGES.flatMap((stage) => stage.supportAgents ?? []));
+  const REVIEWER_AGENTS = new Set(STAGES.map((stage) => stage.reviewer).filter(Boolean));
+  // The agentRef `loadMethodologyKnowledge` (commands/run-stage.js) renders into
+  // every session regardless of which agent runs it.
+  const SHARED_KNOWLEDGE_AGENT_REF = 'shared';
+  const label = (block) => `${block.type}:${block.id}`;
+
+  // One entry per session kind the runtime spawns, each rendering ONE authored
+  // part through the builder that session really uses. `part` is `persona` or
+  // `knowledge`: a release authors engine commands in both, and the guard counts
+  // them the same way.
+  const PROMPTS = Object.freeze({
+    lead: (part, body) =>
+      buildStagePrompt({
+        stage: STAGE,
+        stageBody: 'plain',
+        ...(part === 'persona' ? { agentPersona: body } : { knowledge: body }),
+      }),
+    reviewer: (part, body) =>
+      runStageInternals.buildReviewerPrompt({
+        stage: { ...STAGE, reviewer: { artifact: 'business-logic-model' } },
+        reviewerAgent: 'aidlc-architecture-reviewer-agent',
+        reviewerPersona: part === 'persona' ? body : 'reviewer persona',
+        knowledge: part === 'knowledge' ? body : '',
+        round: 1,
+      }),
+    support: (part, body) => personaBrief('support', part, body),
+    link: (part, body) => personaBrief('link', part, body),
+    integrator: (part, body) => personaBrief('integrator', part, body),
+    composer: (part, body) =>
+      buildComposePrompt({
+        mode: 'initial',
+        persona: part === 'persona' ? body : '',
+        knowledge: part === 'knowledge' ? body : '',
+      }),
+  });
+  const personaBrief = (role, part, body) =>
+    composePersonaPrompt({
+      brief: `${role} brief`,
+      persona: part === 'persona' ? body : 'p',
+      knowledge: part === 'knowledge' ? body : '',
+      role,
+    });
+
+  // Which sessions render ONE claimed block, read off the real catalog. An agent
+  // that leads one stage is frequently a support persona or the reviewer in
+  // another, so these are not exclusive.
+  const sessionsRendering = (block) => {
+    if (block.type === 'STAGE') return ['lead'];
+    const agentRef = block.type === 'AGENT' ? block.blockId : block.agentRef;
+    if (agentRef === COMPOSER_AGENT_ID) return ['composer'];
+    if (agentRef === SHARED_KNOWLEDGE_AGENT_REF) {
+      return ['lead', 'reviewer', 'support', 'link', 'integrator'];
+    }
+    const sessions = [];
+    if (LEAD_AGENTS.has(agentRef)) sessions.push('lead');
+    if (REVIEWER_AGENTS.has(agentRef)) sessions.push('reviewer');
+    if (SUPPORT_AGENTS.has(agentRef)) sessions.push('support', 'link', 'integrator');
+    return sessions;
+  };
+
+  it('enumerates the catalog lead, support and reviewer agents, including dual-role ones', () => {
+    expect(LEAD_AGENTS.size).toBeGreaterThan(0);
+    expect(SUPPORT_AGENTS.size).toBeGreaterThan(0);
+    expect(REVIEWER_AGENTS.size).toBeGreaterThan(0);
+    const dualRole = [...LEAD_AGENTS].filter(
+      (ref) => SUPPORT_AGENTS.has(ref) || REVIEWER_AGENTS.has(ref),
+    );
+    expect(dualRole.length).toBeGreaterThan(0);
+    expect(sessionsRendering({ type: 'KNOWLEDGE', agentRef: dualRole[0] }).length).toBeGreaterThan(
+      1,
+    );
+  });
+
+  it('answers a claimed body in every session the runtime renders it into', () => {
+    const claimed = annexReachingBlocks({ blocks: catalog.blocks });
+    const checked = [];
+
+    for (const block of claimed) {
+      const sessions = sessionsRendering(block);
+      // A claimed body no session renders would make the guard's claim vacuous
+      // rather than wrong, and it would still be a hole: nothing would prove the
+      // answer arrives.
+      expect(sessions.length, label(block)).toBeGreaterThan(0);
+      const parts = block.type === 'STAGE' ? ['stageBody'] : ['persona', 'knowledge'];
+      for (const session of sessions) {
+        for (const part of parts) {
+          const prompt =
+            part === 'stageBody'
+              ? buildStagePrompt({ stage: STAGE, stageBody: TOKEN_BODY })
+              : PROMPTS[session](part, TOKEN_BODY);
+          const where = `${label(block)}:${session}:${part}`;
+          expect(prompt, where).toContain(INVOKE_DIALECT_ANNEX);
+          expect(prompt, where).not.toContain('{{INVOKE}}');
+          checked.push(`${session}:${part}`);
+        }
+      }
+    }
+
+    // Every session kind had to be exercised, or the catalog stopped covering a
+    // role and the check quietly narrowed to the ones that remain.
+    expect([...new Set(checked.map((entry) => entry.split(':')[0]))].toSorted()).toEqual(
+      Object.keys(PROMPTS).toSorted(),
+    );
+    expect(checked.length).toBeGreaterThan(claimed.length);
+  });
+
+  // The other half of the claim: a body type NO builder gates on must stay out
+  // of the set, because a command invoked only there reaches a session with no
+  // answer and has to keep holding promotion.
+  it('leaves the block types no builder gates on out of the set', () => {
+    const claimedTypes = new Set(
+      annexReachingBlocks({ blocks: catalog.blocks }).map((b) => b.type),
+    );
+
+    expect([...claimedTypes].toSorted()).toEqual(['AGENT', 'KNOWLEDGE', 'STAGE']);
+    for (const type of ['RULE', 'SCOPE', 'ARTIFACT', 'SENSOR']) {
+      expect((catalog.blocks[type] ?? []).length, type).toBeGreaterThan(0);
+      expect(claimedTypes.has(type), type).toBe(false);
+    }
   });
 });
