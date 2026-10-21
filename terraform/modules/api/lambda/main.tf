@@ -1973,6 +1973,9 @@ module "gitlab_lambda" {
   handler       = "index.handler"
   runtime       = "nodejs24.x"
   timeout       = 30
+  # The repo picker parses up to 10 pages of full GitLab project objects at
+  # once; the 128 MB default already peaks at ~120 MB on one page.
+  memory_size = 512
 
   source_path = [
     {
