@@ -2954,6 +2954,33 @@ describe('POST /compose — composer sessions', () => {
     expect(JSON.parse(detail.body).composes).toHaveLength(1);
   });
 
+  // Apply normalises the accepted values against the defaults the proposal was
+  // validated against, so the row's settings scope and those defaults reach the
+  // wire together.
+  it('GET /composes carries the settings scope and defaults a proposal was validated against', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedComposeFixtures();
+    const intent = JSON.parse(
+      (await createIntent(sub, projectId, { title: 'I', prompt: 'hotfix the crash' })).body,
+    );
+    await composeReq(sub, projectId, intent.id);
+    const row = [...procStore.values()].find((i) => (i.sk || '').startsWith('COMPOSE#'));
+    row.settingsScope = 'bugfix';
+    row.settingsAuthored = { guardPolicy: 'strict', collaborators: 'off' };
+
+    const list = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}/composes`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+
+    const [compose] = JSON.parse(list.body).composes;
+    expect(compose.settingsScope).toBe('bugfix');
+    expect(compose.settingsAuthored).toEqual({ guardPolicy: 'strict', collaborators: 'off' });
+  });
+
   it('presigns a namespaced report upload for a DRAFT', async () => {
     vi.stubEnv('ARTIFACTS_BUCKET', 'artifacts-test');
     try {
@@ -10058,5 +10085,1060 @@ describe('GET intent — timeline event fields', () => {
     const event = JSON.parse(res.body).events.find((row) => row.eventId === 'e1');
     expect(event).toBeDefined();
     expect(event.detail).toEqual({ round: 1, maxRounds: 2 });
+  });
+});
+
+// Per-intent AI-DLC settings at the API.
+//
+// The property under test: the settings are ORDINARY DRAFT SELECTION STATE. They
+// arrive in the same `PATCH` body as the scope and the composed grid, under the
+// same draft-revision CAS, are normalised against the selection in that same
+// body, store only the deltas from the scope default, are locked once the run
+// starts, and are never writable by an agent. The release used here is the 2.9.0
+// fixture carrying the real 2.11.0 scope frontmatter, so "the release authors
+// this setting" means authored bytes.
+describe('per-intent AI-DLC settings', () => {
+  const SCOPE_FIXTURE = JSON.parse(
+    readFileSync(
+      new URL('../../shared/test/fixtures/aidlc-211-scopes.json', import.meta.url),
+      'utf8',
+    ),
+  );
+  const SETTINGS_PROFILE = 'v2.9.0';
+
+  const filesWithSettingsScopes = () => {
+    const files = filesFromCompatibilityFixture({
+      profileId: SETTINGS_PROFILE,
+      fixture: JSON.parse(
+        readFileSync(
+          new URL(
+            `../../shared/test/fixtures/aidlc-compatibility/${SETTINGS_PROFILE}.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      ),
+    });
+    for (const path of files.keys()) {
+      if (path.startsWith('core/scopes/')) files.delete(path);
+    }
+    for (const [path, entry] of Object.entries(SCOPE_FIXTURE.scopes)) {
+      files.set(path, `---\n${entry.frontmatter}\n---\n[BODY OMITTED]\n`);
+    }
+    return files;
+  };
+
+  const bundle = buildReleaseBundle({
+    profileId: SETTINGS_PROFILE,
+    files: filesWithSettingsScopes(),
+  });
+  const pin = methodologyReleasePinFromManifest(bundle.manifest);
+  const releaseStore = new Map();
+
+  const installReleaseObjects = () => {
+    releaseStore.clear();
+    releaseStore.set(pin.manifestKey, JSON.stringify(bundle.manifest, null, 2));
+    releaseStore.set(pin.catalogKey, JSON.stringify(bundle.catalog, null, 2));
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (!releaseStore.has(input.Key)) {
+        const error = new Error('missing');
+        error.name = 'NoSuchKey';
+        error.$metadata = { httpStatusCode: 404 };
+        throw error;
+      }
+      return { Body: Buffer.from(releaseStore.get(input.Key)) };
+    });
+  };
+
+  const seedRegistryRecord = () => {
+    procStore.set(keyOf(`AIDLC_RELEASE#${pin.releaseId}`, 'META'), {
+      pk: `AIDLC_RELEASE#${pin.releaseId}`,
+      sk: 'META',
+      type: 'AidlcRelease',
+      ...pin,
+      profileId: SETTINGS_PROFILE,
+      upstreamVersion: '2.9.0',
+      upstreamChannel: 'stable',
+      trustTier: 'T1',
+      supportState: 'selectable',
+      fidelityGaps: [],
+      structurallyValid: true,
+      visible: true,
+      runnable: true,
+      notes: null,
+      revision: 1,
+      GSI1PK: 'AIDLC_RELEASES',
+    });
+  };
+
+  const metaFor = (intentId) => procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+
+  const create = async (sub, projectId, body = {}) =>
+    createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'classic',
+      methodologyReleaseId: pin.releaseId,
+      ...body,
+    });
+
+  const patch = (sub, projectId, intentId, body, { revision = null } = {}) =>
+    handler({
+      httpMethod: 'PATCH',
+      path: `/projects/${projectId}/intents/${intentId}`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify({
+        ifDraftRevision: revision ?? metaFor(intentId)?.draftRevision ?? 0,
+        ...body,
+      }),
+      ...claims(sub),
+    });
+
+  // The shape the collaborative page always sends: the whole selection, with the
+  // settings beside it. Nothing else can set a setting.
+  const save = (sub, projectId, intentId, body = {}, options = {}) =>
+    patch(
+      sub,
+      projectId,
+      intentId,
+      {
+        scope: metaFor(intentId)?.scope ?? 'classic',
+        composedGrid: null,
+        ...body,
+      },
+      options,
+    );
+
+  const settingsEvents = () =>
+    [...procStore.values()].filter((row) => row.eventType === 'v2.intent.settings.changed');
+
+  const addProjectMember = async (projectId, sub, role = 'member') => {
+    await g.addV('User').property('id', sub).property('email', `${sub}@x`).next();
+    await g
+      .V()
+      .has('Project', 'id', projectId)
+      .addE('HAS_MEMBER')
+      .property('role', role)
+      .to(gremlin.process.statics.V().has('User', 'id', sub))
+      .next();
+  };
+
+  const settingsFixture = async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+    seedRegistryRecord();
+    return { sub, projectId };
+  };
+
+  beforeEach(() => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'on');
+    releaseResolverTest.releaseClosureCache.clear();
+    installReleaseObjects();
+  });
+
+  it('stores a member’s override and says so in the timeline', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).aidlcSettings).toEqual({
+      guardPolicy: 'strict',
+    });
+    expect(metaFor(intent.id).aidlcSettings).toEqual({ guardPolicy: 'strict' });
+    const events = settingsEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0].summary).toBe(
+      'guard_policy set to strict for this intent (the classic scope default: off)',
+    );
+    expect(events[0].actor).toBeTruthy();
+  });
+
+  // The invariant that makes every later statement about a setting's origin
+  // true: `classic` authors plan_approval on, so choosing "on" is not an
+  // override and nothing is stored for it.
+  it('stores nothing for a choice that equals the scope default', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await save(sub, projectId, intent.id, {
+      aidlcSettings: { planApproval: 'on' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).not.toHaveProperty('aidlcSettings');
+    expect(Object.hasOwn(metaFor(intent.id), 'aidlcSettings')).toBe(false);
+    expect(settingsEvents()).toEqual([]);
+  });
+
+  it('refuses a value the capability registry does not allow, naming the field', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'paranoid' },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({
+      code: 'aidlc_setting_invalid',
+      field: 'guardPolicy',
+      values: ['strict', 'relaxed', 'off'],
+    });
+    expect(metaFor(intent.id).aidlcSettings).toBeUndefined();
+  });
+
+  // The create/PATCH boundary is where a client supplies raw JSON: an accepted
+  // `['off']` or `'true'` would be stored with that type and then match no
+  // runtime branch, because every consumer compares with `===`.
+  it.each([
+    ['a singleton array', { collaborators: ['off'] }, 'collaborators'],
+    ['a quoted boolean', { existingCode: 'true' }, 'existingCode'],
+    ['a number', { planApproval: 0 }, 'planApproval'],
+    ['a record object', { guardPolicy: { value: 'off' } }, 'guardPolicy'],
+  ])(
+    'refuses %s for a setting of the wrong authored type',
+    async (_label, aidlcSettings, field) => {
+      const { sub, projectId } = await settingsFixture();
+      const intent = JSON.parse((await create(sub, projectId, { scope: 'bugfix' })).body);
+
+      const res = await save(sub, projectId, intent.id, {
+        scope: 'bugfix',
+        aidlcSettings,
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body)).toMatchObject({
+        code: 'aidlc_setting_invalid',
+        field,
+      });
+    },
+  );
+
+  it('refuses a setting name it does not know', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await save(sub, projectId, intent.id, {
+      aidlcSettings: { teamMemoryTier: 'strict' },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({
+      code: 'aidlc_setting_unknown',
+      field: 'teamMemoryTier',
+    });
+  });
+
+  // A setting the selection does not author is DROPPED rather than refused: the
+  // page offers no control for it, so a save that still carries one is a stale
+  // document, not a confused client. The response names what went.
+  it('drops a setting the selection does not author and names it', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId, { scope: 'bugfix' })).body);
+    await save(sub, projectId, intent.id, {
+      scope: 'bugfix',
+      aidlcSettings: { existingCode: false, guardPolicy: 'strict' },
+    });
+    expect(metaFor(intent.id).aidlcSettings).toEqual({
+      existingCode: false,
+      guardPolicy: 'strict',
+    });
+
+    const moved = await save(sub, projectId, intent.id, {
+      scope: 'classic',
+      aidlcSettings: { existingCode: false, guardPolicy: 'strict' },
+    });
+
+    expect(moved.statusCode).toBe(200);
+    const body = JSON.parse(moved.body);
+    expect(body.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+    expect(body.aidlcSettingsDropped).toEqual(['existingCode']);
+    expect(
+      settingsEvents()
+        .map((row) => row.summary)
+        .at(-1),
+    ).toBe('existing_code withdrawn: the classic scope does not offer it');
+  });
+
+  it('returns a setting to the scope default when the override is cleared', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    const cleared = await save(sub, projectId, intent.id, {
+      aidlcSettings: null,
+    });
+
+    expect(cleared.statusCode).toBe(200);
+    expect(JSON.parse(cleared.body)).not.toHaveProperty('aidlcSettings');
+    // Cleared REMOVEs the attribute rather than writing null, so a draft that
+    // ends with no overrides has exactly the row shape it had before it ever
+    // had one.
+    expect(Object.hasOwn(metaFor(intent.id), 'aidlcSettings')).toBe(false);
+    expect(
+      settingsEvents()
+        .map((row) => row.summary)
+        .at(-1),
+    ).toBe('guard_policy returned to the classic scope default (off)');
+  });
+
+  // A draft that has no settings is not on the settings path, however a client
+  // phrases that: `aidlcSettings: null` for an intent that has none asks for
+  // nothing. The row keeps exactly the attributes it had, the DTO is unchanged
+  // and nothing is audited.
+  it('leaves a draft with no settings on the path it always took', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const before = metaFor(intent.id);
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: before.scope,
+      composedGrid: null,
+      aidlcSettings: null,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).not.toHaveProperty('aidlcSettings');
+    expect(Object.hasOwn(metaFor(intent.id), 'aidlcSettings')).toBe(false);
+    expect(settingsEvents()).toEqual([]);
+  });
+
+  // The extra CONSISTENT pre-image read belongs to the settings path, and a body
+  // that never mentions the field cannot reach it: the selection save every
+  // unpinned, 2.3.3, 2.8.2 and 2.9.0 draft makes still reads the row exactly
+  // once, eventually consistently.
+  it('reads a draft once for a selection save that mentions no setting', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const before = metaFor(intent.id);
+    const metaReadsFrom = (index) =>
+      ddbMock
+        .commandCalls(GetCommand)
+        .slice(index)
+        .map((call) => call.args[0].input)
+        .filter((input) => input.Key?.pk === `EXEC#${intent.id}` && input.Key?.sk === 'META');
+    const readsBefore = ddbMock.commandCalls(GetCommand).length;
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: before.scope,
+      composedGrid: null,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(metaReadsFrom(readsBefore).filter((input) => input.ConsistentRead)).toEqual([]);
+    expect(Object.hasOwn(metaFor(intent.id), 'aidlcSettings')).toBe(false);
+    expect(settingsEvents()).toEqual([]);
+  });
+
+  // The same body on a STARTED intent of a draft that has no settings is the
+  // ordinary "the draft is closed" refusal, not the settings-specific one: a
+  // client that mentions no setting is not asking to change one.
+  it('refuses a no-settings save on a started intent as a closed draft', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const metaRow = metaFor(intent.id);
+    procStore.set(keyOf(`EXEC#${intent.id}`, 'META'), { ...metaRow, status: 'RUNNING' });
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: metaRow.scope,
+      composedGrid: null,
+      aidlcSettings: null,
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).code).toBeUndefined();
+  });
+
+  // The run honours whatever META holds, so a selection change must not leave an
+  // override the new scope does not author sitting there to be honoured — even
+  // when the client never mentions the settings. The same write records the
+  // withdrawal.
+  it('normalises the recorded settings when the selection changes without them', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId, { scope: 'bugfix' })).body);
+    await save(sub, projectId, intent.id, {
+      scope: 'bugfix',
+      aidlcSettings: { existingCode: false },
+    });
+    expect(metaFor(intent.id).aidlcSettings).toEqual({ existingCode: false });
+
+    const moved = await patch(sub, projectId, intent.id, {
+      scope: 'classic',
+      composedGrid: null,
+    });
+
+    expect(moved.statusCode).toBe(200);
+    expect(JSON.parse(moved.body)).not.toHaveProperty('aidlcSettings');
+    expect(Object.hasOwn(metaFor(intent.id), 'aidlcSettings')).toBe(false);
+    expect(
+      settingsEvents()
+        .map((row) => row.summary)
+        .at(-1),
+    ).toBe('existing_code withdrawn: the classic scope does not offer it');
+  });
+
+  // The page prunes a setting the new selection does not author locally, before
+  // saving, so the payload that arrives no longer carries it and the server
+  // drops nothing. It is still a WITHDRAWAL: the new scope does not offer the
+  // setting, so it cannot have a default to return to.
+  it('audits a setting the client already pruned as withdrawn', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId, { scope: 'bugfix' })).body);
+    await save(sub, projectId, intent.id, {
+      scope: 'bugfix',
+      aidlcSettings: { existingCode: false },
+    });
+
+    const moved = await save(sub, projectId, intent.id, {
+      scope: 'classic',
+      aidlcSettings: {},
+    });
+
+    expect(moved.statusCode).toBe(200);
+    expect(JSON.parse(moved.body)).not.toHaveProperty('aidlcSettingsDropped');
+    expect(
+      settingsEvents()
+        .map((row) => row.summary)
+        .at(-1),
+    ).toBe('existing_code withdrawn: the classic scope does not offer it');
+  });
+
+  // The pre-image the diff and the authored map come from is read CONSISTENTLY
+  // on the settings path, so a replication lag is not turned into a refusal:
+  // the save conditions on the revision it will actually replace.
+  it('does not turn a lagging read into a conflict', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    await save(sub, projectId, intent.id, { aidlcSettings: { guardPolicy: 'strict' } });
+    const current = metaFor(intent.id);
+    ddbMock.on(GetCommand, { Key: { pk: `EXEC#${intent.id}`, sk: 'META' } }).callsFake((input) => {
+      const item = metaFor(intent.id);
+      if (input.ConsistentRead) return { Item: { ...item } };
+      return { Item: { ...item, draftRevision: (item.draftRevision ?? 0) - 1 } };
+    });
+
+    const res = await save(
+      sub,
+      projectId,
+      intent.id,
+      { aidlcSettings: { guardPolicy: 'relaxed' } },
+      { revision: current.draftRevision },
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(metaFor(intent.id).aidlcSettings).toEqual({ guardPolicy: 'relaxed' });
+  });
+
+  // The same lag on a clear-all. The page sends `aidlcSettings: null` only once
+  // it has seen a setting, so a replica that has not yet caught up with the
+  // write that recorded one must not be what decides that the body asks for
+  // nothing: that would answer 200, keep the override the run honours, show the
+  // scope default on the page and audit nothing.
+  it('clears every setting over a lagging read', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    const lagging = structuredClone(metaFor(intent.id));
+    await save(sub, projectId, intent.id, { aidlcSettings: { guardPolicy: 'strict' } });
+    const current = metaFor(intent.id);
+    ddbMock.on(GetCommand, { Key: { pk: `EXEC#${intent.id}`, sk: 'META' } }).callsFake((input) => {
+      if (input.ConsistentRead) return { Item: { ...metaFor(intent.id) } };
+      // The replica has not yet seen the write that recorded the override.
+      return { Item: { ...lagging } };
+    });
+
+    const res = await save(
+      sub,
+      projectId,
+      intent.id,
+      { aidlcSettings: null },
+      { revision: current.draftRevision },
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).not.toHaveProperty('aidlcSettings');
+    expect(Object.hasOwn(metaFor(intent.id), 'aidlcSettings')).toBe(false);
+    expect(
+      settingsEvents()
+        .map((row) => row.summary)
+        .at(-1),
+    ).toBe('guard_policy returned to the classic scope default (off)');
+  });
+
+  // The guard that makes the stale-snapshot class unreachable: the settings are
+  // only ever normalised against a selection that arrived in the same body.
+  it('refuses settings sent without the selection they belong to', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await patch(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).code).toBe('selection_required_with_settings');
+    expect(metaFor(intent.id).aidlcSettings).toBeUndefined();
+  });
+
+  // The second half of the same guard: the row the diff and the authored map
+  // came from must be the row the CAS replaces, so an eventually consistent
+  // read cannot produce a correct write with a false timeline entry.
+  it('refuses a settings save whose read revision is not the one it conditions on', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    const stale = (metaFor(intent.id).draftRevision ?? 0) + 3;
+
+    const res = await save(
+      sub,
+      projectId,
+      intent.id,
+      { aidlcSettings: { guardPolicy: 'strict' } },
+      { revision: stale },
+    );
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).code).toBe('edit_conflict');
+    expect(metaFor(intent.id).aidlcSettings).toBeUndefined();
+    expect(settingsEvents()).toEqual([]);
+  });
+
+  it('refuses a stale draft revision like every other selection change', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    const res = await save(
+      sub,
+      projectId,
+      intent.id,
+      { aidlcSettings: { guardPolicy: 'relaxed' } },
+      { revision: 0 },
+    );
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).code).toBe('edit_conflict');
+    expect(metaFor(intent.id).aidlcSettings).toEqual({ guardPolicy: 'strict' });
+  });
+
+  it('answers 428 when no edit revision was read at all', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await handler({
+      httpMethod: 'PATCH',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      body: JSON.stringify({
+        scope: 'classic',
+        aidlcSettings: { guardPolicy: 'strict' },
+      }),
+      ...claims(sub),
+    });
+
+    expect(res.statusCode).toBe(428);
+    expect(JSON.parse(res.body).code).toBe('edit_precondition_required');
+  });
+
+  // A mid-run settings change is refused by name in the dialect annex.
+  // This is the endpoint saying a human cannot make one either, once the run
+  // has started — with its own code, distinct from "the draft is closed".
+  it('locks the settings once the run has started', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    const row = metaFor(intent.id);
+    procStore.set(keyOf(`EXEC#${intent.id}`, 'META'), {
+      ...row,
+      status: 'RUNNING',
+    });
+
+    const res = await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).code).toBe('settings_locked');
+    const plain = await patch(sub, projectId, intent.id, { title: 'Renamed' });
+    expect(plain.statusCode).toBe(409);
+    expect(JSON.parse(plain.body).code).toBeUndefined();
+  });
+
+  // An intent that never had these switches must come back exactly as it did
+  // before they existed: no new key, not even a null one.
+  it('omits the settings entirely from an intent that has none', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const created = JSON.parse((await create(sub, projectId)).body);
+
+    expect(created).not.toHaveProperty('aidlcSettings');
+    const saved = await patch(sub, projectId, created.id, { title: 'Renamed' });
+    expect(saved.statusCode).toBe(200);
+    const body = JSON.parse(saved.body);
+    expect(body).not.toHaveProperty('aidlcSettings');
+    expect(body).not.toHaveProperty('aidlcSettingsDropped');
+    expect(settingsEvents()).toEqual([]);
+  });
+
+  it('accepts the settings at create, normalised against the created selection', async () => {
+    const { sub, projectId } = await settingsFixture();
+
+    const res = await create(sub, projectId, {
+      aidlcSettings: { guardPolicy: 'strict', planApproval: 'on' },
+    });
+
+    expect(res.statusCode).toBe(201);
+    const intent = JSON.parse(res.body);
+    expect(intent.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+    expect(metaFor(intent.id).aidlcSettings).toEqual({ guardPolicy: 'strict' });
+    expect(settingsEvents().map((row) => row.summary)).toEqual([
+      'guard_policy set to strict for this intent (the classic scope default: off)',
+    ]);
+
+    const bad = await create(sub, projectId, {
+      aidlcSettings: { guardPolicy: 'paranoid' },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(JSON.parse(bad.body).code).toBe('aidlc_setting_invalid');
+  });
+
+  // Two members changing DIFFERENT settings concurrently both survive, because
+  // the document merges them per key and the save that lands carries both.
+  // Changing the SAME setting is last-writer-wins, identical to two members
+  // changing the scope.
+  it('keeps both members’ settings when they change different ones', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const peer = `u-${randomUUID()}`;
+    await addProjectMember(projectId, peer);
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+    const second = await save(peer, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict', collaborators: 'on' },
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(JSON.parse(second.body).aidlcSettings).toEqual({
+      guardPolicy: 'strict',
+      collaborators: 'on',
+    });
+    // Only the key that actually changed is on the timeline, with the member
+    // whose write changed it.
+    const events = settingsEvents();
+    expect(events).toHaveLength(2);
+    expect(events[1].summary).toBe(
+      'collaborators set to on for this intent (the classic scope default: off)',
+    );
+    expect(events[1].actor).toContain(peer);
+  });
+
+  it('writes no event and no revision bump for a save that changes no setting', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+    const before = settingsEvents().length;
+
+    const again = await save(sub, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    expect(again.statusCode).toBe(200);
+    expect(JSON.parse(again.body).aidlcSettings).toEqual({
+      guardPolicy: 'strict',
+    });
+    expect(settingsEvents()).toHaveLength(before);
+  });
+
+  it('refuses a draft whose settings do not resolve a runnable plan', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+
+    const res = await save(sub, projectId, intent.id, {
+      scope: 'not-a-scope',
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(metaFor(intent.id).aidlcSettings).toBeUndefined();
+  });
+
+  it('refuses a settings write from a member of another project', async () => {
+    const { sub, projectId } = await settingsFixture();
+    const intent = JSON.parse((await create(sub, projectId)).body);
+    const outsider = `u-${randomUUID()}`;
+    await g.addV('User').property('id', outsider).property('email', `${outsider}@x`).next();
+
+    const res = await save(outsider, projectId, intent.id, {
+      aidlcSettings: { guardPolicy: 'strict' },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(metaFor(intent.id).aidlcSettings).toBeUndefined();
+  });
+});
+
+// The stock scope a composed grid runs on. The grid's own `scope` is a label,
+// so this field is what carries the policy and the settings a member may
+// choose; it belongs to the grid and must leave with it.
+describe('the policy scope a composed grid runs on', () => {
+  const SCOPE_FIXTURE = JSON.parse(
+    readFileSync(
+      new URL('../../shared/test/fixtures/aidlc-211-scopes.json', import.meta.url),
+      'utf8',
+    ),
+  );
+  const PROFILE = 'v2.9.0';
+
+  const compatibilityFiles = () =>
+    filesFromCompatibilityFixture({
+      profileId: PROFILE,
+      fixture: JSON.parse(
+        readFileSync(
+          new URL(
+            `../../shared/test/fixtures/aidlc-compatibility/${PROFILE}.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      ),
+    });
+
+  const filesWithSettingsScopes = () => {
+    const files = compatibilityFiles();
+    for (const path of files.keys()) {
+      if (path.startsWith('core/scopes/')) files.delete(path);
+    }
+    for (const [path, entry] of Object.entries(SCOPE_FIXTURE.scopes)) {
+      files.set(path, `---\n${entry.frontmatter}\n---\n[BODY OMITTED]\n`);
+    }
+    return files;
+  };
+
+  const bundle = buildReleaseBundle({ profileId: PROFILE, files: filesWithSettingsScopes() });
+  const pin = methodologyReleasePinFromManifest(bundle.manifest);
+  const releaseStore = new Map();
+
+  const installReleaseObjects = () => {
+    releaseStore.clear();
+    releaseStore.set(pin.manifestKey, JSON.stringify(bundle.manifest, null, 2));
+    releaseStore.set(pin.catalogKey, JSON.stringify(bundle.catalog, null, 2));
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (!releaseStore.has(input.Key)) {
+        const error = new Error('missing');
+        error.name = 'NoSuchKey';
+        error.$metadata = { httpStatusCode: 404 };
+        throw error;
+      }
+      return { Body: Buffer.from(releaseStore.get(input.Key)) };
+    });
+  };
+
+  const seedRegistryRecord = () => {
+    procStore.set(keyOf(`AIDLC_RELEASE#${pin.releaseId}`, 'META'), {
+      pk: `AIDLC_RELEASE#${pin.releaseId}`,
+      sk: 'META',
+      type: 'AidlcRelease',
+      ...pin,
+      profileId: PROFILE,
+      upstreamVersion: '2.9.0',
+      upstreamChannel: 'stable',
+      trustTier: 'T1',
+      supportState: 'selectable',
+      fidelityGaps: [],
+      structurallyValid: true,
+      visible: true,
+      runnable: true,
+      notes: null,
+      revision: 1,
+      GSI1PK: 'AIDLC_RELEASES',
+    });
+  };
+
+  const metaFor = (intentId) => procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+
+  const fixture = async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+    seedRegistryRecord();
+    return { sub, projectId };
+  };
+
+  const GRID = Object.fromEntries(
+    bundle.catalog.workflow.placements.map((placement) => [placement.stageId, 'EXECUTE']),
+  );
+
+  const gridFor = async (sub, projectId) =>
+    JSON.parse(
+      (
+        await createIntent(sub, projectId, {
+          title: 'I',
+          prompt: 'Build X',
+          scope: 'enterprise',
+          methodologyReleaseId: pin.releaseId,
+        })
+      ).body,
+    );
+
+  const patch = (sub, projectId, intentId, body) =>
+    handler({
+      httpMethod: 'PATCH',
+      path: `/projects/${projectId}/intents/${intentId}`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify({
+        ifDraftRevision: metaFor(intentId)?.draftRevision ?? 0,
+        ...body,
+      }),
+      ...claims(sub),
+    });
+
+  beforeEach(() => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'on');
+    releaseResolverTest.releaseClosureCache.clear();
+    installReleaseObjects();
+  });
+
+  it('keeps the base scope with the grid and offers its settings', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    const saved = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'enterprise',
+      aidlcSettings: { guardPolicy: 'off' },
+    });
+
+    expect(saved.statusCode).toBe(200);
+    const body = JSON.parse(saved.body);
+    expect(body.policyScope).toBe('enterprise');
+    // `enterprise` authors guard_policy strict, so `off` is a real override and
+    // is kept — which it could not be if the label carried the policy.
+    expect(body.aidlcSettings).toEqual({ guardPolicy: 'off' });
+    expect(metaFor(intent.id).policyScope).toBe('enterprise');
+  });
+
+  it('clears the base scope in the same write that clears the grid', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+    await patch(sub, projectId, intent.id, {
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'enterprise',
+    });
+    expect(metaFor(intent.id).policyScope).toBe('enterprise');
+
+    const cleared = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise',
+      composedGrid: null,
+    });
+
+    expect(cleared.statusCode).toBe(200);
+    expect(JSON.parse(cleared.body)).not.toHaveProperty('policyScope');
+    expect(metaFor(intent.id).policyScope).toBeUndefined();
+  });
+
+  it('refuses a base scope for a selection that names its scope directly', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise',
+      composedGrid: null,
+      policyScope: 'enterprise',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/applies to a composed stage grid/);
+  });
+
+  it('refuses a base scope the pinned workflow does not have', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'not-a-scope',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/Unknown policyScope "not-a-scope"/);
+  });
+
+  it('omits the field entirely for an intent that names its scope directly', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    expect(intent).not.toHaveProperty('policyScope');
+    expect(metaFor(intent.id).policyScope).toBeUndefined();
+  });
+
+  it('records the base scope a grid is created with', async () => {
+    const { sub, projectId } = await fixture();
+
+    const created = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'enterprise',
+      methodologyReleaseId: pin.releaseId,
+    });
+
+    expect(created.statusCode).toBe(201);
+    const intent = JSON.parse(created.body);
+    expect(intent.policyScope).toBe('enterprise');
+    expect(metaFor(intent.id).policyScope).toBe('enterprise');
+  });
+
+  // Where the base IS honoured it has to name a real scope block, at create as
+  // on the save: a grid created with a base that resolves to nothing would run
+  // with no policy at all.
+  it('refuses a base scope the pinned workflow does not have at create', async () => {
+    const { sub, projectId } = await fixture();
+
+    const created = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'not-a-scope',
+      methodologyReleaseId: pin.releaseId,
+    });
+
+    expect(created.statusCode).toBe(400);
+    expect(JSON.parse(created.body).error).toMatch(/Unknown policyScope "not-a-scope"/);
+  });
+
+  // The same field against a library whose scopes author none of these
+  // settings. The base resolves no policy there, so it is IGNORED: accepted,
+  // never stored and never a refusal. The page records the base for every
+  // stock scope, so this is the save a 2.3.3, 2.8.2 or 2.9.0 draft now makes,
+  // and its row has to stay the row it had before this field existed.
+  describe('against a library that authors no settings', () => {
+    const legacyBundle = buildReleaseBundle({ profileId: PROFILE, files: compatibilityFiles() });
+    const legacyPin = methodologyReleasePinFromManifest(legacyBundle.manifest);
+
+    const legacyFixture = async () => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+      procStore.set(keyOf(`AIDLC_RELEASE#${legacyPin.releaseId}`, 'META'), {
+        pk: `AIDLC_RELEASE#${legacyPin.releaseId}`,
+        sk: 'META',
+        type: 'AidlcRelease',
+        ...legacyPin,
+        profileId: PROFILE,
+        upstreamVersion: '2.9.0',
+        upstreamChannel: 'stable',
+        trustTier: 'T1',
+        supportState: 'selectable',
+        fidelityGaps: [],
+        structurallyValid: true,
+        visible: true,
+        runnable: true,
+        notes: null,
+        revision: 1,
+        GSI1PK: 'AIDLC_RELEASES',
+      });
+      releaseStore.set(legacyPin.manifestKey, JSON.stringify(legacyBundle.manifest, null, 2));
+      releaseStore.set(legacyPin.catalogKey, JSON.stringify(legacyBundle.catalog, null, 2));
+      const intent = JSON.parse(
+        (
+          await createIntent(sub, projectId, {
+            title: 'I',
+            prompt: 'Build X',
+            scope: 'enterprise',
+            methodologyReleaseId: legacyPin.releaseId,
+          })
+        ).body,
+      );
+      return { sub, projectId, intent };
+    };
+
+    const LEGACY_GRID = Object.fromEntries(
+      legacyBundle.catalog.workflow.placements.map((placement) => [placement.stageId, 'EXECUTE']),
+    );
+
+    it('accepts a base scope and stores nothing for it', async () => {
+      const { sub, projectId, intent } = await legacyFixture();
+
+      const saved = await patch(sub, projectId, intent.id, {
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise',
+      });
+
+      expect(saved.statusCode).toBe(200);
+      expect(JSON.parse(saved.body)).not.toHaveProperty('policyScope');
+      expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+
+    // Not a refusal either when the name resolves to nothing: an older bundle
+    // sent the display label here, and the member who is still running it must
+    // not have a save rejected for a field this library never reads.
+    it('ignores a base scope it cannot resolve instead of refusing the save', async () => {
+      const { sub, projectId, intent } = await legacyFixture();
+
+      const saved = await patch(sub, projectId, intent.id, {
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise-custom',
+      });
+
+      expect(saved.statusCode).toBe(200);
+      expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+
+    // Create answers the same way, so the field is ignored on every route this
+    // library has. A member who composes a grid before the first save sends the
+    // base at create, and the row create writes has to be the row it has always
+    // written.
+    it('creates a grid intent with nothing stored for its base scope', async () => {
+      const { sub, projectId } = await legacyFixture();
+
+      const created = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise',
+        methodologyReleaseId: legacyPin.releaseId,
+      });
+
+      expect(created.statusCode).toBe(201);
+      const intent = JSON.parse(created.body);
+      expect(intent).not.toHaveProperty('policyScope');
+      expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+
+    it('creates a grid intent with a base scope it cannot resolve', async () => {
+      const { sub, projectId } = await legacyFixture();
+
+      const created = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise-custom',
+        methodologyReleaseId: legacyPin.releaseId,
+      });
+
+      expect(created.statusCode).toBe(201);
+      expect(Object.hasOwn(metaFor(JSON.parse(created.body).id), 'policyScope')).toBe(false);
+    });
   });
 });
