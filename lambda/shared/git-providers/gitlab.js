@@ -44,6 +44,25 @@ const apiHeaders = (token, extra = {}) => ({
   ...extra,
 });
 
+// GitLab refresh tokens are single-use, so concurrent requests sharing a ctx
+// must not each spend it. Refresh at most once per rejected access token:
+// - a 401 for a token ctx has already replaced retries with the current token;
+// - a 401 while (or after) that token's refresh runs shares its outcome, so a
+//   genuine rejection is reported, and its bindings invalidated, only once.
+const refreshFor = (ctx, rejectedToken) => {
+  if (ctx.token !== rejectedToken) return Promise.resolve(ctx.token);
+  if (ctx.refreshing?.from !== rejectedToken) {
+    const promise = Promise.resolve()
+      .then(() => ctx.onRefresh())
+      .then((newToken) => {
+        ctx.token = newToken;
+        return newToken;
+      });
+    ctx.refreshing = { from: rejectedToken, promise };
+  }
+  return ctx.refreshing.promise;
+};
+
 // ctx = { token, fetchImpl?, onRefresh? }
 //   onRefresh: async () => newAccessToken  — supplied by the handler to refresh
 //   an expired GitLab token (persisting to SSM/DDB) and mutate ctx.token.
@@ -53,11 +72,11 @@ const glFetch = async (ctx, url, options = {}) => {
     ...options,
     headers: { ...apiHeaders(token), ...options.headers },
   });
-  const res = await doFetch(url, withAuth(ctx.token));
+  const sentToken = ctx.token;
+  const res = await doFetch(url, withAuth(sentToken));
   if (res.status === 401 && typeof ctx.onRefresh === 'function') {
     try {
-      const newToken = await ctx.onRefresh();
-      ctx.token = newToken;
+      const newToken = await refreshFor(ctx, sentToken);
       return doFetch(url, withAuth(newToken));
     } catch (e) {
       logger.error('token refresh failed, returning original 401', e, { url });
@@ -205,9 +224,9 @@ const fetchRepoPage = async (ctx, page) => {
   };
 };
 
-// Page 1 goes first and alone: it settles any 401 token refresh (GitLab
-// refresh tokens are single-use, so parallel refreshes would race) and its
-// X-Total-Pages header bounds the rest. A full GitLab project page takes ~5s,
+// Page 1 goes first and alone: its X-Total-Pages header bounds the rest, and
+// it settles a token that had already expired. A token that expires mid-list
+// is refreshed once for all parallel pages by glFetch (see refreshFor). A full GitLab project page takes ~5s,
 // so the remaining pages are fetched in parallel rather than in sequence.
 // GitLab omits X-Total-Pages above 10,000 results; then fetch up to the cap.
 const listRepos = async (ctx) => {

@@ -638,6 +638,134 @@ describe('gitlab provider — repo browse + MR + token refresh', () => {
     await expect(gl.listRepos({ token: 't', fetchImpl })).rejects.toThrow('403 Forbidden');
   });
 
+  describe('listRepos token refresh across parallel pages', () => {
+    const fullPage = (n) =>
+      Array.from({ length: 100 }, (_, i) => ({
+        id: n * 100 + i,
+        name: `p${n}-${i}`,
+        path_with_namespace: `g/p${n}-${i}`,
+        visibility: 'private',
+      }));
+    // GitLab double: accepts only `validTokens`, reports `totalPages`, and
+    // answers each page after `delays[page]` ms so tests can order 401s.
+    const gitlabDouble = ({ validTokens, totalPages = 3, delays = {} }) => {
+      const calls = [];
+      const fetchImpl = async (url, options) => {
+        const page = Number(new URL(url).searchParams.get('page'));
+        const token = options.headers.Authorization.replace('Bearer ', '');
+        calls.push({ page, token });
+        if (delays[page]) await new Promise((r) => setTimeout(r, delays[page]));
+        if (!validTokens().includes(token)) {
+          return { ok: false, status: 401, json: async () => ({ message: '401 Unauthorized' }) };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => fullPage(page),
+          headers: { get: (h) => (h === 'x-total-pages' ? String(totalPages) : null) },
+        };
+      };
+      return { fetchImpl, calls };
+    };
+    const expectOrdered = (repos, pages = 3) => {
+      expect(repos).toHaveLength(pages * 100);
+      expect(repos.map((r) => r.id)).toEqual(
+        Array.from({ length: pages * 100 }, (_, i) => i + 100),
+      );
+    };
+
+    it('refreshes once when the token has expired before page 1', async () => {
+      let valid = [];
+      const onRefresh = vi.fn(async () => {
+        valid = ['NEW'];
+        return 'NEW';
+      });
+      const { fetchImpl } = gitlabDouble({ validTokens: () => valid });
+      const ctx = { token: 'OLD', fetchImpl, onRefresh };
+      expectOrdered(await gl.listRepos(ctx));
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(ctx.token).toBe('NEW');
+    });
+
+    it('refreshes once when the token expires between page 1 and the parallel pages', async () => {
+      let valid = ['OLD'];
+      const { fetchImpl, calls } = gitlabDouble({ validTokens: () => valid });
+      // Page 1 succeeds with OLD, then the token expires before pages 2..3.
+      const wrapped = async (url, options) => {
+        const res = await fetchImpl(url, options);
+        if (calls.length === 1) valid = [];
+        return res;
+      };
+      const onRefresh = vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        valid = ['NEW'];
+        return 'NEW';
+      });
+      const ctx = { token: 'OLD', fetchImpl: wrapped, onRefresh };
+      expectOrdered(await gl.listRepos(ctx));
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(
+        calls
+          .filter((c) => c.token === 'NEW')
+          .map((c) => c.page)
+          .sort(),
+      ).toEqual([2, 3]);
+    });
+
+    it('retries a late old-token 401 with the replacement token instead of refreshing again', async () => {
+      let valid = ['OLD'];
+      // Page 3's 401 for OLD arrives well after page 2's refresh completed.
+      const { fetchImpl, calls } = gitlabDouble({ validTokens: () => valid, delays: { 3: 30 } });
+      const wrapped = async (url, options) => {
+        if (calls.length === 1) valid = [];
+        return fetchImpl(url, options);
+      };
+      const onRefresh = vi.fn(async () => {
+        valid = ['NEW'];
+        return 'NEW';
+      });
+      const ctx = { token: 'OLD', fetchImpl: wrapped, onRefresh };
+      expectOrdered(await gl.listRepos(ctx));
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(calls.filter((c) => c.page === 3).map((c) => c.token)).toEqual(['OLD', 'NEW']);
+    });
+
+    it('reports a genuine refresh rejection once and fails the listing', async () => {
+      let valid = ['OLD'];
+      const { fetchImpl, calls } = gitlabDouble({ validTokens: () => valid });
+      const wrapped = async (url, options) => {
+        const res = await fetchImpl(url, options);
+        if (calls.length === 1) valid = [];
+        return res;
+      };
+      const onRefresh = vi.fn(async () => {
+        throw new ProviderError(400, 'invalid_grant');
+      });
+      const ctx = { token: 'OLD', fetchImpl: wrapped, onRefresh };
+      await expect(gl.listRepos(ctx)).rejects.toThrow('401 Unauthorized');
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(ctx.token).toBe('OLD');
+    });
+
+    it('refreshes again when a replacement token later expires too', async () => {
+      let n = 0;
+      const onRefresh = vi.fn(async () => `T${++n}`);
+      let valid = [];
+      const fetchImpl = async (_url, options) => {
+        const token = options.headers.Authorization.replace('Bearer ', '');
+        if (!valid.includes(token)) return { ok: false, status: 401, json: async () => ({}) };
+        return { ok: true, status: 200, json: async () => [{ name: 'main' }] };
+      };
+      const ctx = { token: 'OLD', fetchImpl, onRefresh };
+      valid = ['T1'];
+      await gl.listBranches(ctx, 'g/p');
+      valid = ['T2'];
+      await gl.listBranches(ctx, 'g/p');
+      expect(onRefresh).toHaveBeenCalledTimes(2);
+      expect(ctx.token).toBe('T2');
+    });
+  });
+
   it('glFetch refreshes the token once on 401 and retries', async () => {
     let calls = 0;
     const fetchImpl = async (url, options) => {
