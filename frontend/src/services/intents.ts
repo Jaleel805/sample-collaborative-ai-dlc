@@ -497,12 +497,13 @@ export interface SensorFileDiagnostic {
   file: string;
   result?: string;
   timedOut?: boolean;
+  // `null` when the file produced no detail (a timeout, or no verdict at all).
   detail?: {
     reason?: string;
     exitCode?: number | null;
     stderr?: string | null;
     [key: string]: unknown;
-  };
+  } | null;
 }
 
 // Loosely-typed sensor verdict detail — the fields any evaluator may emit. All
@@ -514,8 +515,11 @@ export interface SensorDetail {
   consumes?: string[];
   reason?: string;
   error?: string;
+  notApplicable?: boolean;
   findings_count?: number;
   harnessFailures?: SensorHarnessFailure[];
+  // A `script` sensor runs once per matching file, so the runner aggregates the
+  // per-file verdicts here and the explanation sits on the entry, not the top.
   files?: SensorFileDiagnostic[];
   filesOmitted?: number;
   omissionReason?: string;
