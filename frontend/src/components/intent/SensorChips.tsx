@@ -80,7 +80,7 @@ export function summarizeSensorDetail(detail: SensorDetail | null, result?: stri
   if (Array.isArray(detail.unreferenced) && detail.unreferenced.length) {
     return redactRenderedDiagnostic(`unreferenced: ${detail.unreferenced.join(', ')}`);
   }
-  if (detail.error) return bounded(detail.error);
+  if (typeof detail.error === 'string' && detail.error) return bounded(detail.error);
   // The top level WINS whenever it carries any explanatory field — that is the
   // `graph` shape and the runner's own `{ error }` verdicts, which must read
   // exactly as before. Only an aggregate-only detail falls through to the

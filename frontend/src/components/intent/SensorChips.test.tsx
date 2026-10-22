@@ -136,6 +136,18 @@ describe('summarizeSensorDetail', () => {
     expect(summarizeSensorDetail({ error: { code: 2 } as unknown as string })).toBeNull();
   });
 
+  // A script's own top-level `error` may be any JSON value. Only a string is an
+  // explanation; anything else must not hide the reason beside it, which the
+  // gate already shows.
+  it('keeps a top-level reason beside a non-string error', () => {
+    expect(
+      summarizeSensorDetail({
+        error: { code: 2 } as unknown as string,
+        reason: '3 type errors in src/app.ts',
+      }),
+    ).toBe('3 type errors in src/app.ts');
+  });
+
   it('leaves the top level in charge when it explains itself', () => {
     expect(
       summarizeSensorDetail({
