@@ -30,9 +30,12 @@ import {
   SENSOR_RESULT,
   SENSOR_APPLICABILITY,
   sensorKind,
+  scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -600,12 +603,21 @@ const summarizeFileResults = (fileResults, sensitiveValues = []) => {
 // exits for harness failures, while custom exit-code sensors retain the classic
 // non-zero-is-FAIL convention. A stdout-json sensor may report PASS or FAIL only
 // by emitting exactly one JSON value with a boolean `pass` field on exit zero.
+//
+// `dispatcherExitCodes` is the contract the pinned catalog authored (see
+// `sensorDeclaresDispatcherExitCodes`). When a catalog declares it, the
+// documented non-zero exits are read by that contract instead of the default
+// mapping below: 127 is the script reporting that its tool or that tool's
+// config could not be used, which its own dispatcher answers with a pass rather
+// than a finding, and any other non-zero exit keeps its verdict but now carries
+// the exit code and a stderr excerpt naming the breakage.
 const resultFromScript = ({
   exitCode,
   stdout,
   stderr = '',
   verdictMode = 'exit-code',
   sensitiveValues = [],
+  dispatcherExitCodes = false,
 } = {}) => {
   const stdoutText = typeof stdout === 'string' ? stdout.trim() : '';
   const diagnostic = tailDiagnostic(stderr, sensitiveValues);
@@ -670,6 +682,17 @@ const resultFromScript = ({
     }
   }
 
+  // A catalog that authored the dispatcher's exit-code contract reads its own
+  // documented exits. That is strictly narrower than the default mapping that
+  // follows, so a catalog which declares nothing is unaffected.
+  if (dispatcherExitCodes && Number.isInteger(exitCode) && exitCode !== 0) {
+    const dispatched = resultFromDispatcherExit({ exitCode, stderr });
+    return {
+      result: dispatched.result,
+      detail: redactDiagnostic(dispatched.detail, sensitiveValues),
+    };
+  }
+
   if (exitCode === TOOL_UNAVAILABLE_EXIT) return inconclusive('tool-unavailable');
   const nonZero = exitCode !== 0 && exitCode !== 2 && exitCode != null;
   if (nonZero && verdictMode === 'stdout-json') return inconclusive('script-error');
@@ -683,14 +706,22 @@ const resultFromScript = ({
   };
 };
 
+const STAGE_BUDGET_EXHAUSTED = 'the stage budget was exhausted before this file was examined';
+
 // A pinned sensor whose script could not be verified or read has not produced a
 // verdict at all, so its severity does not apply — the check is missing, which is
 // the drift the release pin exists to prevent. run-stage applies the same test to
 // the persona and knowledge bodies its ensemble sessions read.
+//
+// `runtime_file_missing` is listed explicitly because it does not carry the
+// `release_` prefix: the resolver raises it when a release manifest lists an
+// object that is absent from storage. An incompletely published closure is a
+// release integrity failure exactly like a digest mismatch, so it must hold the
+// stage rather than degrade to a best-effort advisory note.
 export const isReleaseDependencyError = (error) =>
   ['ReleaseResolverError', 'AidlcReleaseError'].includes(error?.name) &&
   (String(error.code ?? '').startsWith('release_') ||
-    ['unpinned_user_block', 'user_block_missing'].includes(error.code));
+    ['runtime_file_missing', 'unpinned_user_block', 'user_block_missing'].includes(error.code));
 
 // Create the sensor runner. `graph` is the graph-writer (for reading produced
 // artifact content); `loadBlockScript` fetches a sensor's `.ts` from S3;
@@ -705,8 +736,19 @@ export const createSensorRunner = ({
   childEnv = process.env,
   changedFileProvenance = null,
   fileListOptions = {},
+  // Milliseconds left of the stage's wall-clock budget, read per child. The
+  // stage deadline — not the contract's ceiling — is what keeps a long sensor
+  // from outliving the container. Absent (unpinned, a policy-free release, or a
+  // caller with no deadline) leaves the authored budget alone.
+  remainingStageMs = null,
+  // Resolves the sibling modules a pinned sensor script imports, so the spawned
+  // interpreter can load them. Absent in legacy mode, where a sensor script is
+  // one self-contained object.
+  loadScriptClosure = null,
 } = {}) => {
   const sensitiveValues = sensitiveEnvironmentValues(childEnv);
+  const readRemainingStageMs = () =>
+    typeof remainingStageMs === 'function' ? remainingStageMs() : remainingStageMs;
   // Evaluate one `graph` sensor against the artifacts this stage produced. Each
   // produced artifact's content is read from Neptune and fed to the in-process
   // evaluator. The worst result across the produced artifacts wins (a single
@@ -766,6 +808,7 @@ export const createSensorRunner = ({
                 // blocks. Default lenient — absence is an audit finding until
                 // field-test compliance justifies flipping the switch.
                 strictStructuredBlocks: Boolean(sensor.strictStructuredBlocks),
+                recordTimestampExempt: Boolean(sensor.recordTimestampExempt),
               });
         details.push({ artifact: artifactType, id: row.id ?? null, ...evalled.detail });
         if (evalled.result === SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.FAIL;
@@ -921,26 +964,73 @@ export const createSensorRunner = ({
         detail: { error: 'sensor has no script' },
       };
     }
+    // Resolve the script's import closure BEFORE writing anything: an
+    // incomplete closure must leave no half-materialized script behind for a
+    // later pass to pick up.
+    let closureFiles = [];
+    if (loadScriptClosure) {
+      try {
+        closureFiles = await loadScriptClosure(spec.sensorId, script);
+      } catch (error) {
+        if (!isReleaseDependencyError(error)) throw error;
+        return {
+          result: SENSOR_RESULT.BLOCKED,
+          fatal: true,
+          detail: {
+            error: error.message,
+            name: error.name,
+            code: error.code,
+            releaseIntegrityFailure: true,
+            ...(error.details ? { details: error.details } : {}),
+          },
+        };
+      }
+    }
     const scriptDir = path.join(workspaceDir, '.aidlc', 'sensors');
     await mkdir(scriptDir, { recursive: true });
     const scriptPath = path.join(scriptDir, `${spec.sensorId ?? 'sensor'}.ts`);
     await writeFile(scriptPath, script, 'utf8');
+    for (const dependency of closureFiles) {
+      const dependencyPath = path.resolve(scriptDir, dependency.relativePath);
+      await mkdir(path.dirname(dependencyPath), { recursive: true });
+      await writeFile(dependencyPath, dependency.content, 'utf8');
+    }
     const { file, args } = buildScriptArgv(spec, { scriptPath, substitutions });
 
-    // One run per matching file (the upstream scripts take a single --file-path).
+    // One run per matching file (each upstream script takes a single path, on
+    // the flag its own manifest declares). The stage budget is re-read
+    // immediately before EVERY launch — after materialization, which itself
+    // costs time — because the sampled allowance of the first file is not the
+    // allowance the tenth one has left. An exhausted budget stops the pass: the
+    // files it never reached are recorded non-PASS, so an expired stage never
+    // reads as a clean sweep.
     const verdictMode = spec.verdictMode;
     const fileResults = [];
     let worst = SENSOR_RESULT.PASS;
+    let tightest = null;
+    let exhausted = false;
+    const dispatcherExitCodes = Boolean(sensor.dispatcherExitCodes);
     for (const rel of matched) {
+      const bound = scriptTimeoutBound(spec.timeoutSeconds, readRemainingStageMs());
+      if (bound.exhausted) {
+        exhausted = true;
+        break;
+      }
+      if (tightest === null || bound.timeoutMs < tightest.timeoutMs) tightest = bound;
       const run = await runChild({
         file,
-        args: [...args, '--stage', stageId ?? '', '--file-path', rel],
-        timeoutMs: spec.timeoutMs,
+        args: [...args, '--stage', stageId ?? '', spec.pathFlag, rel],
+        timeoutMs: bound.timeoutMs,
         cwd: workspaceDir,
         env: childEnv,
         spawnFn,
       });
-      const { result, detail } = resultFromScript({ ...run, verdictMode, sensitiveValues });
+      const { result, detail } = resultFromScript({
+        ...run,
+        verdictMode,
+        sensitiveValues,
+        dispatcherExitCodes,
+      });
       fileResults.push({ file: rel, result, timedOut: run.timedOut, detail });
       if (result === SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.FAIL;
       else if (result === SENSOR_RESULT.BLOCKED && worst !== SENSOR_RESULT.FAIL)
@@ -952,6 +1042,25 @@ export const createSensorRunner = ({
       )
         worst = SENSOR_RESULT.INCONCLUSIVE;
     }
+    if (exhausted) {
+      for (const rel of matched.slice(fileResults.length)) {
+        fileResults.push({
+          file: rel,
+          result: SENSOR_RESULT.BLOCKED,
+          timedOut: false,
+          detail: { error: STAGE_BUDGET_EXHAUSTED },
+        });
+      }
+      if (worst !== SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.BLOCKED;
+    }
+    // The reason the gate finding and the activity note read lives at the sensor
+    // level, not on the per-file rows, so the contract's explanation is
+    // summarized here too. Read off the unsummarized rows, because grouping
+    // collapses them. Null when no file hit a documented exit, which keeps every
+    // other sweep's detail exactly as it was.
+    const exitReason = dispatcherExitCodes
+      ? dispatcherExitReason(fileResults, matched.length)
+      : null;
     return {
       result: worst,
       applicability,
@@ -960,6 +1069,15 @@ export const createSensorRunner = ({
         applicability,
         provenance,
         ...summarizeFileResults(fileResults, sensitiveValues),
+        ...(exitReason ? { reason: exitReason } : {}),
+        // A budget the stage deadline shortened is reported, so a run cut short
+        // does not read as the sensor's own timeout. The narrowest bound any
+        // launch got is the one reported; exhaustion without a launch contributes
+        // no bound. Callers with no deadline retain their legacy detail.
+        ...(tightest?.boundedBy === 'stage-deadline'
+          ? { timeoutMs: tightest.timeoutMs, boundedBy: tightest.boundedBy }
+          : {}),
+        ...(exhausted ? { stageBudgetExhausted: true } : {}),
       },
     };
   };

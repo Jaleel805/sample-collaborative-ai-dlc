@@ -102,6 +102,10 @@ import { LOOP_BACK_OPTION, parseChoice } from '../../shared/gate-answer.js';
 import { ingestStageCodeTraceability as defaultIngestStageCodeTraceability } from '../code-traceability.js';
 import { createSensorRunner, isReleaseDependencyError } from '../sensor-runner.js';
 import {
+  createReleaseScriptClosureReader,
+  releaseOwnedSensorPredicate,
+} from '../release-script-closure.js';
+import {
   evaluateGatePreconditions,
   mergeFindings,
   sensorGateFindings,
@@ -685,6 +689,8 @@ const runStageSensors = async ({
   publish,
   changedFiles = null,
   planes = null,
+  remainingStageMs = null,
+  loadScriptClosure = null,
 }) => {
   let graph = null;
   let gConn = null;
@@ -713,6 +719,8 @@ const runStageSensors = async ({
       publish,
       changedFiles,
       planes,
+      remainingStageMs,
+      loadScriptClosure,
     });
   } finally {
     await closeGraphSource(gConn);
@@ -756,6 +764,8 @@ const runSensorsWithGraph = async ({
   publish,
   changedFiles = null,
   planes = null,
+  remainingStageMs = null,
+  loadScriptClosure = null,
 }) => {
   const runner = createSensorRunner({
     graph,
@@ -769,6 +779,8 @@ const runSensorsWithGraph = async ({
     spawnFn,
     childEnv: env,
     changedFileProvenance,
+    remainingStageMs,
+    loadScriptClosure,
   });
 
   const verdicts = await runner.runStageSensors({
@@ -1991,6 +2003,14 @@ const runStageAttempt = async (
     workflow: loaded.workflow,
     library: loaded.library,
     learningRules: memory.learningRules,
+  });
+  // Null in legacy mode, where a sensor script is one self-contained object.
+  // Bound to the resolved library's provenance: the release publishes a closure
+  // for its OWN sensors only, so a user-tenant SENSOR overlay keeps the
+  // existing user-script path.
+  const loadScriptClosure = createReleaseScriptClosureReader({
+    methodologyRelease,
+    releaseOwnsSensor: releaseOwnedSensorPredicate(library.sensorsById),
   });
 
   const resolved = resolveStage({
@@ -4684,12 +4704,18 @@ const runStageAttempt = async (
       intentId,
       openGraph,
       loadBlockScript: loadScript,
+      loadScriptClosure,
       workspaceDir,
       changedFileProvenance,
       env,
       spawnFn,
       store,
       publish,
+      // Budget enforcement follows authored release policy, like repair turns.
+      // Policy-free catalogs (including 2.3.3) keep their legacy sensor budget.
+      ...(methodologyRelease && stage.policy
+        ? { remainingStageMs: () => stageDeadlineMs - nowMs() }
+        : {}),
       ...postAgentSensorPass({ methodologyRelease, attemptChangedFiles: changedFiles }),
     }).catch(() => null);
     if (writePlane?.held) {
@@ -4938,6 +4964,7 @@ const runStageAttempt = async (
         intentId,
         openGraph,
         loadBlockScript: loadScript,
+        loadScriptClosure,
         workspaceDir,
         env,
         spawnFn,
@@ -4945,6 +4972,7 @@ const runStageAttempt = async (
         publish,
         planes: ['gate'],
         changedFileProvenance,
+        ...(stage.policy ? { remainingStageMs: () => stageDeadlineMs - nowMs() } : {}),
       });
     } catch (error) {
       gatePlaneError = error?.message ?? String(error);

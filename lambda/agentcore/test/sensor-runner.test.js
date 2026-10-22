@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -407,6 +407,84 @@ describe('sensor diagnostics', () => {
     expect(elapsedMs).toBeLessThan(4_000);
     expect(Buffer.byteLength(JSON.stringify(detail), 'utf8')).toBeLessThanOrEqual(120_000);
     expect((detail.files?.length ?? 0) + detail.filesOmitted).toBe(entries.length);
+  });
+
+  // Without the authored contract nothing moves: an unpinned run and every
+  // catalog that invokes its scripts directly keep the default mapping.
+  it('keeps the default mapping for non-zero exits without the authored contract', () => {
+    expect(
+      resultFromScript({ exitCode: 127, stdout: '', stderr: 'eslint-unavailable' }),
+    ).toMatchObject({
+      result: 'INCONCLUSIVE',
+      detail: { reason: 'tool-unavailable', exitCode: 127 },
+    });
+    expect(
+      resultFromScript({ exitCode: 1, stdout: '', stderr: 'eslint-bad-output' }),
+    ).toMatchObject({ result: 'FAIL', detail: { exitCode: 1 } });
+  });
+
+  // With it, the exits the release's own dispatcher documents are read the way
+  // it reads them, and the reason reaches the record.
+  it('passes exit 127 with the tool named when the contract is authored', () => {
+    expect(
+      resultFromScript({
+        exitCode: 127,
+        stdout: '',
+        stderr: 'eslint-unavailable\n',
+        dispatcherExitCodes: true,
+      }),
+    ).toMatchObject({
+      result: 'PASS',
+      detail: {
+        toolUnavailable: true,
+        exitCode: 127,
+        reason: 'eslint is not available here, so the check did not run',
+      },
+    });
+  });
+
+  it('passes exit 127 with the missing config named when the contract is authored', () => {
+    expect(
+      resultFromScript({
+        exitCode: 127,
+        stdout: '',
+        stderr: 'no-eslint-config\n',
+        dispatcherExitCodes: true,
+      }).detail.reason,
+    ).toBe('no eslint configuration was found, so the check did not run');
+  });
+
+  it('reports a script error with its exit code and stderr', () => {
+    expect(
+      resultFromScript({
+        exitCode: 1,
+        stdout: '',
+        stderr: 'eslint-bad-output\n',
+        dispatcherExitCodes: true,
+      }),
+    ).toMatchObject({
+      result: 'FAIL',
+      detail: { scriptError: true, exitCode: 1, stderr: 'eslint-bad-output' },
+    });
+  });
+
+  it('still reads a verdict the script printed on exit 0 under the contract', () => {
+    expect(
+      resultFromScript({ exitCode: 0, stdout: '{"pass":false}', dispatcherExitCodes: true }),
+    ).toMatchObject({ result: 'FAIL', detail: { pass: false } });
+  });
+
+  // A timeout has no exit code to read, so the contract cannot apply and the
+  // default mapping stands.
+  it('leaves a timeout BLOCKED under the contract (no exit code to read)', () => {
+    expect(
+      resultFromScript({
+        exitCode: null,
+        stdout: '',
+        stderr: '',
+        dispatcherExitCodes: true,
+      }),
+    ).toMatchObject({ result: 'BLOCKED' });
   });
 });
 
@@ -1241,5 +1319,489 @@ describe('runStageSensors — script kind', () => {
       held: true,
       detail: { error: releaseError.message, code: releaseError.code, name: releaseError.name },
     });
+  });
+});
+
+// The record sensor runs in-process over graph artifacts, so the exemption has
+// to travel on the plan sensor entry to reach the evaluator at all.
+describe('runStageSensors — a timestamp run record at the gate', () => {
+  const runnerFor = () =>
+    createSensorRunner({
+      graph: fakeGraph({
+        'practices-discovery-timestamp': [
+          { id: 'ts1', content: 'Discovered: 2026-10-08T00:00:00Z\n' },
+        ],
+      }),
+      loadBlockScript: async () => '',
+      workspaceDir: null,
+    });
+
+  const verdictFor = async (sensor) =>
+    (
+      await runnerFor().runStageSensors({
+        sensors: [sensor],
+        outputArtifacts: [{ artifact: 'practices-discovery-timestamp' }],
+        stageId: 'practices-discovery',
+      })
+    )[0];
+
+  it('reports two missing headings when the catalog claims no record coverage', async () => {
+    const verdict = await verdictFor({ sensorId: 'required-sections', severity: 'advisory' });
+    expect(verdict).toMatchObject({ kind: 'graph', result: 'FAIL', held: false });
+    expect(verdict.detail.artifacts[0]).toMatchObject({ h2_count: 0, findings_count: 2 });
+  });
+
+  it('passes when the plan carries the catalog record coverage', async () => {
+    const verdict = await verdictFor({
+      sensorId: 'required-sections',
+      severity: 'advisory',
+      recordTimestampExempt: true,
+    });
+    expect(verdict).toMatchObject({ result: 'PASS' });
+    expect(verdict.detail.artifacts[0]).toMatchObject({ h2_count: 0, findings_count: 0 });
+  });
+});
+
+// A release sensor script's sibling imports. Without them the spawned
+// interpreter fails at startup with `Cannot find module` before the sensor
+// checks anything, which is what every pinned document sensor did.
+describe('runStageSensors — script import closure', () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-closure-'));
+    await mkdir(path.join(ws, 'src'), { recursive: true });
+    await writeFile(path.join(ws, 'src', 'a.ts'), 'export const x = 1;');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const okSpawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setTimeout(() => {
+      child.stdout.emit('data', Buffer.from('{"pass":true}'));
+      child.emit('close', 0);
+    }, 0);
+    return child;
+  };
+
+  const LINTER = Object.freeze({
+    sensorId: 'linter',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: 'bun aidlc-sensor-linter.ts',
+    matches: '**/*.ts',
+    timeoutSeconds: 5,
+  });
+
+  const runWith = async (loadScriptClosure) => {
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'import { budget } from "./aidlc-runtime-budget.ts";',
+      workspaceDir: ws,
+      spawnFn: okSpawn,
+      loadScriptClosure,
+    });
+    return runner.runStageSensors({ sensors: [LINTER], stageId: 'code-generation' });
+  };
+
+  const sensorsDir = () => path.join(ws, '.aidlc', 'sensors');
+
+  it('writes each sibling module next to the script before spawning it', async () => {
+    const verdicts = await runWith(async (sensorId, script) => {
+      expect(sensorId).toBe('linter');
+      expect(script).toContain('./aidlc-runtime-budget.ts');
+      return [{ relativePath: 'aidlc-runtime-budget.ts', content: 'export const budget = 1;' }];
+    });
+    expect(verdicts[0].result).toBe('PASS');
+    expect(await readFile(path.join(sensorsDir(), 'linter.ts'), 'utf8')).toContain(
+      './aidlc-runtime-budget.ts',
+    );
+    expect(await readFile(path.join(sensorsDir(), 'aidlc-runtime-budget.ts'), 'utf8')).toBe(
+      'export const budget = 1;',
+    );
+  });
+
+  it('holds the stage on an incomplete closure and writes nothing', async () => {
+    const error = Object.assign(new Error('core/tools/aidlc-runtime-budget.ts is not published'), {
+      name: 'ReleaseResolverError',
+      code: 'release_script_dependency_missing',
+    });
+    const verdicts = await runWith(async () => {
+      throw error;
+    });
+    expect(verdicts[0]).toMatchObject({
+      result: 'BLOCKED',
+      detail: { code: 'release_script_dependency_missing', releaseIntegrityFailure: true },
+    });
+    await expect(readFile(path.join(sensorsDir(), 'linter.ts'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('writes only the script when no closure reader is injected', async () => {
+    const verdicts = await runWith(null);
+    expect(verdicts[0].result).toBe('PASS');
+    expect(await readdir(sensorsDir())).toEqual(['linter.ts']);
+  });
+
+  // The resolver raises `runtime_file_missing` — a code without the `release_`
+  // prefix — when the release manifest lists a dependency whose object is gone
+  // from storage. An incompletely published closure has to hold the stage like
+  // any other integrity failure; classifying it as a best-effort loader error
+  // let an advisory sensor continue on a release that cannot be run.
+  it('holds the stage when a manifest-listed dependency is missing from storage', async () => {
+    const verdicts = await runWith(async () => {
+      throw Object.assign(new Error('runtime object for core/tools/aidlc-lib.ts is missing'), {
+        name: 'ReleaseResolverError',
+        code: 'runtime_file_missing',
+        details: { repoPath: 'core/tools/aidlc-lib.ts' },
+      });
+    });
+    expect(verdicts[0]).toMatchObject({
+      result: 'BLOCKED',
+      held: true,
+      detail: {
+        code: 'runtime_file_missing',
+        releaseIntegrityFailure: true,
+        details: { repoPath: 'core/tools/aidlc-lib.ts' },
+      },
+    });
+    await expect(readFile(path.join(sensorsDir(), 'linter.ts'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+});
+
+// The flag a script sensor is spawned with comes from the plan, which resolved
+// it from the sensor's declared contract. A document sensor spawned with the
+// code sensors' --file-path exits before it runs its check.
+describe('runStageSensors — script argv', () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-argv-'));
+    await mkdir(path.join(ws, 'aidlc-docs'), { recursive: true });
+    await writeFile(path.join(ws, 'aidlc-docs', 'traceability.json'), '{}');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const spawnRecording = (calls) => (file, args) => {
+    calls.push({ file, args });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setTimeout(() => {
+      child.stdout.emit('data', Buffer.from('{"pass":true}'));
+      child.emit('close', 0);
+    }, 0);
+    return child;
+  };
+
+  const runWith = async (sensor, runnerOptions = {}) => {
+    const calls = [];
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'SENSOR_SCRIPT_BODY',
+      workspaceDir: ws,
+      spawnFn: spawnRecording(calls),
+      ...runnerOptions,
+    });
+    const verdicts = await runner.runStageSensors({
+      sensors: [sensor],
+      stageId: 'intent-capture',
+    });
+    return { calls, verdicts };
+  };
+
+  const traceability = {
+    sensorId: 'traceability',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: 'bun aidlc-sensor-traceability.ts',
+    matches: '**/traceability.json',
+    timeoutSeconds: 5,
+  };
+
+  it('spawns a document sensor on the output path its plan entry carries', async () => {
+    const { calls, verdicts } = await runWith({ ...traceability, pathFlag: '--output-path' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual([
+      path.join(ws, '.aidlc', 'sensors', 'traceability.ts'),
+      '--stage',
+      'intent-capture',
+      '--output-path',
+      'aidlc-docs/traceability.json',
+    ]);
+    expect(verdicts[0].result).toBe('PASS');
+  });
+
+  it('spawns a sensor with no resolved flag on the file path, as before', async () => {
+    const { calls } = await runWith(traceability);
+    expect(calls[0].args.slice(-2)).toEqual(['--file-path', 'aidlc-docs/traceability.json']);
+  });
+
+  it('shortens a long budget to the stage deadline and says so in the verdict', async () => {
+    const { calls, verdicts } = await runWith(
+      { ...traceability, timeoutSeconds: 1200 },
+      { remainingStageMs: () => 90000 },
+    );
+    expect(calls).toHaveLength(1);
+    expect(verdicts[0].detail).toMatchObject({ timeoutMs: 90000, boundedBy: 'stage-deadline' });
+  });
+
+  it('reports no bound when the authored budget is the one that runs', async () => {
+    const { verdicts } = await runWith(traceability, { remainingStageMs: () => 90000 });
+    expect(verdicts[0].detail).not.toHaveProperty('boundedBy');
+  });
+});
+
+// What is left of the stage's wall-clock budget bounds EVERY child, not just the
+// first. A sensor matching several files handed each of them the allowance the
+// first one found, and an already-expired budget restored the whole authored
+// allowance instead of stopping the pass — so the bound protected nothing.
+describe('runStageSensors — the stage budget bounds every child', () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-budget-'));
+    await writeFile(path.join(ws, 'a.ts'), 'export const a = 1;');
+    await writeFile(path.join(ws, 'b.ts'), 'export const b = 2;');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const typeCheck = {
+    sensorId: 'type-check',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: 'bun aidlc-sensor-type-check.ts',
+    matches: '**/*.ts',
+    timeoutSeconds: 600,
+  };
+
+  // Returns each value in turn, then repeats the last one — so a test can say
+  // "there was time for the first file and none for the second".
+  const remainingSequence = (values, reads) => () => {
+    const value = values[Math.min(reads.length, values.length - 1)];
+    reads.push(value);
+    return value;
+  };
+
+  const runWith = async ({ sensor = typeCheck, remaining = null } = {}) => {
+    const calls = [];
+    const reads = [];
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'SENSOR_SCRIPT_BODY',
+      workspaceDir: ws,
+      spawnFn: (file, args) => {
+        calls.push({ file, args });
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        setTimeout(() => {
+          child.stdout.emit('data', Buffer.from('{"pass":true}'));
+          child.emit('close', 0);
+        }, 0);
+        return child;
+      },
+      ...(remaining ? { remainingStageMs: remainingSequence(remaining, reads) } : {}),
+    });
+    const verdicts = await runner.runStageSensors({ sensors: [sensor], stageId: 'construction' });
+    return { calls, reads, verdict: verdicts[0] };
+  };
+
+  it('re-reads what is left of the stage before each file, not once for the pass', async () => {
+    const { calls, reads, verdict } = await runWith({ remaining: [300000, 120000] });
+    expect(calls).toHaveLength(2);
+    expect(reads).toEqual([300000, 120000]);
+    expect(verdict.detail).toMatchObject({ timeoutMs: 120000, boundedBy: 'stage-deadline' });
+  });
+
+  it('stops the sweep when the budget runs out part-way, and says which file it never read', async () => {
+    const { calls, verdict } = await runWith({ remaining: [300000, -1] });
+    expect(calls).toHaveLength(1);
+    expect(verdict.result).toBe('BLOCKED');
+    expect(verdict.detail.stageBudgetExhausted).toBe(true);
+    expect(verdict.detail.files).toHaveLength(2);
+    expect(verdict.detail.files[1]).toMatchObject({
+      result: 'BLOCKED',
+      detail: { error: expect.stringContaining('stage budget was exhausted') },
+    });
+    expect(verdict.detail).toMatchObject({ timeoutMs: 300000, boundedBy: 'stage-deadline' });
+  });
+
+  it('launches nothing at all once the stage deadline has already passed', async () => {
+    const { calls, verdict } = await runWith({ remaining: [-1] });
+    expect(calls).toEqual([]);
+    expect(verdict.result).toBe('BLOCKED');
+    expect(verdict.detail).toMatchObject({ stageBudgetExhausted: true });
+    expect(verdict.detail.files.map((f) => f.result)).toEqual(['BLOCKED', 'BLOCKED']);
+    expect(verdict.detail).not.toHaveProperty('timeoutMs');
+    expect(verdict.detail).not.toHaveProperty('boundedBy');
+  });
+
+  it('reports exhaustion without a launch bound when the earlier child kept its authored budget', async () => {
+    const { calls, verdict } = await runWith({ remaining: [900000, 0] });
+    expect(calls).toHaveLength(1);
+    expect(verdict.detail).toMatchObject({ stageBudgetExhausted: true });
+    expect(verdict.detail.files.map((f) => f.result)).toEqual(['PASS', 'BLOCKED']);
+    expect(verdict.detail).not.toHaveProperty('timeoutMs');
+    expect(verdict.detail).not.toHaveProperty('boundedBy');
+  });
+
+  it('holds the stage on an exhausted budget when the sensor is blocking', async () => {
+    const { verdict } = await runWith({
+      sensor: { ...typeCheck, severity: 'blocking' },
+      remaining: [0],
+    });
+    expect(verdict.held).toBe(true);
+  });
+
+  it('leaves the authored budget alone when no deadline is available', async () => {
+    const { calls, verdict } = await runWith();
+    expect(calls).toHaveLength(2);
+    expect(verdict.result).toBe('PASS');
+    expect(verdict.detail).not.toHaveProperty('boundedBy');
+    expect(verdict.detail).not.toHaveProperty('stageBudgetExhausted');
+  });
+});
+
+// D3 on staging: every file of a pinned `linter` sweep recorded
+// `{result:"FAIL",detail:null}` because each child exited non-zero without a
+// JSON line, and neither the exit code nor stderr was kept. The release's own
+// dispatcher answers 127 with a tool-unavailable PASS, so a pinned sweep reads
+// it that way too, and a real script error keeps its FAIL but now says why.
+describe("runStageSensors — a release script sensor's documented exit codes", () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-exit-'));
+    await mkdir(path.join(ws, 'src'), { recursive: true });
+    await writeFile(path.join(ws, 'src', 'a.ts'), 'export const a = 1;');
+    await writeFile(path.join(ws, 'src', 'b.ts'), 'export const b = 2;');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const exitingSpawn = (exitCode, stderr) => () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setTimeout(() => {
+      if (stderr) child.stderr.emit('data', Buffer.from(stderr));
+      child.emit('close', exitCode);
+    }, 0);
+    return child;
+  };
+
+  const linter = (extra = {}) => ({
+    sensorId: 'linter',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: '{{INVOKE}} engine sensor-linter',
+    matches: '**/*.{ts,js}',
+    timeoutSeconds: 30,
+    ...extra,
+  });
+
+  const verdictFor = async ({ exitCode, stderr, sensor }) => {
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'console.log("x");',
+      workspaceDir: ws,
+      spawnFn: exitingSpawn(exitCode, stderr),
+    });
+    const [verdict] = await runner.runStageSensors({
+      sensors: [sensor],
+      stageId: 'functional-design',
+    });
+    return verdict;
+  };
+
+  it('passes a tool-unavailable sweep and names the tool on the record', async () => {
+    const verdict = await verdictFor({
+      exitCode: 127,
+      stderr: 'eslint-unavailable\n',
+      sensor: linter({ dispatcherExitCodes: true }),
+    });
+    expect(verdict).toMatchObject({ kind: 'script', result: 'PASS', held: false });
+    expect(verdict.detail.reason).toBe(
+      '2 of 2 files: eslint is not available here, so the check did not run',
+    );
+    for (const file of verdict.detail.files) {
+      expect(file).toMatchObject({
+        result: 'PASS',
+        detail: {
+          toolUnavailable: true,
+          exitCode: 127,
+          reason: 'eslint is not available here, so the check did not run',
+        },
+      });
+    }
+  });
+
+  it('names the missing config when that is what the script reported', async () => {
+    const verdict = await verdictFor({
+      exitCode: 127,
+      stderr: 'no-eslint-config\n',
+      sensor: linter({ dispatcherExitCodes: true }),
+    });
+    expect(verdict.result).toBe('PASS');
+    expect(verdict.detail.reason).toBe(
+      '2 of 2 files: no eslint configuration was found, so the check did not run',
+    );
+  });
+
+  it('records a script error as the FAIL it was, now with the exit code and stderr', async () => {
+    const verdict = await verdictFor({
+      exitCode: 1,
+      stderr: 'eslint-bad-output\nat parse (file.ts:1:1)\n',
+      sensor: linter({ dispatcherExitCodes: true }),
+    });
+    expect(verdict).toMatchObject({ result: 'FAIL', held: false });
+    expect(verdict.detail.reason).toBe(
+      '2 of 2 files: the sensor script exited 1 without a verdict',
+    );
+    expect(verdict.detail.files[0].detail).toMatchObject({
+      scriptError: true,
+      exitCode: 1,
+      stderr: 'eslint-bad-output\nat parse (file.ts:1:1)',
+    });
+  });
+
+  it('a blocking script error holds the stage', async () => {
+    const verdict = await verdictFor({
+      exitCode: 1,
+      stderr: 'eslint-bad-output\n',
+      sensor: linter({ severity: 'blocking', dispatcherExitCodes: true }),
+    });
+    expect(verdict).toMatchObject({ result: 'FAIL', held: true });
+  });
+
+  // The behaviour an unpinned run and every pre-dispatcher catalog still get:
+  // the default exit mapping, with none of the dispatcher contract's reading of
+  // the exit and no sensor-level reason summarizing it.
+  it('keeps the default mapping when the catalog authors no contract', async () => {
+    const verdict = await verdictFor({
+      exitCode: 127,
+      stderr: 'eslint-unavailable\n',
+      sensor: linter(),
+    });
+    expect(verdict).toMatchObject({ kind: 'script', result: 'INCONCLUSIVE' });
+    expect(verdict.detail).not.toHaveProperty('reason');
+    for (const failure of verdict.detail.harnessFailures) {
+      expect(failure).toMatchObject({ reason: 'tool-unavailable', exitCode: 127 });
+      expect(failure).not.toHaveProperty('toolUnavailable');
+      expect(failure).not.toHaveProperty('scriptError');
+    }
   });
 });

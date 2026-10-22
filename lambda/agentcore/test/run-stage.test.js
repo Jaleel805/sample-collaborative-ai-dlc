@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Logger } from '@aws-lambda-powertools/logger';
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import { filesFromCompatibilityFixture } from '../../shared/aidlc-compatibility.js';
+import { buildFromFiles } from '../../shared/block-mappers.js';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
@@ -7540,6 +7543,195 @@ describe('postAgentSensorPass', () => {
   });
 });
 
+// The stage deadline reaches only release-pinned passes with authored policy.
+// Unpinned and policy-free baseline passes keep their legacy sensor budgets.
+describe('runStage — the stage budget at the post-agent sensor pass', () => {
+  // `type-check` declares the stdout-json verdict protocol, so the stub child
+  // has to print a verdict the way the real script does — an exit code alone is
+  // a missing verdict, not a pass.
+  const okSpawn = () => ({
+    stdout: {
+      on: (ev, cb) => ev === 'data' && setImmediate(() => cb(Buffer.from('{"pass":true}'))),
+    },
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  const libWithScriptSensor = () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].sensors = ['type-check'];
+    lib.sensorsById = {
+      'type-check': {
+        id: 'type-check',
+        command: 'bun <runtime-managed>/tools/aidlc-sensor-type-check.ts',
+        runtime: 'bun',
+        severity: 'advisory',
+        matches: '**/*.ts',
+        timeoutSeconds: 600,
+        scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
+      },
+    };
+    return lib;
+  };
+
+  const budgetedSensorRun = async ({
+    methodologyRelease = null,
+    stageBudgetMs,
+    sensorLibrary = null,
+    spawned = [],
+  }) => {
+    const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-sensor-budget-'));
+    await writeFile(nodePath.join(workspaceDir, 'a.ts'), 'export const value = 1;');
+    const lib = sensorLibrary ?? libWithScriptSensor();
+    if (methodologyRelease && !sensorLibrary) {
+      lib.fromRelease = true;
+      lib.scopesById = { feature: { id: 'feature', sensorsPolicy: 'on' } };
+    }
+    const deps = baseDeps({
+      spawnFn: (file, args) => {
+        if (file === 'bun') spawned.push({ file, args: args.slice(1) });
+        return okSpawn();
+      },
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+      loadBlockScript: async () => 'export default 1;',
+      stageBudgetMs,
+    });
+    try {
+      const res = await runStage(
+        { ...baseArgs, workspaceDir, ...(methodologyRelease ? { methodologyRelease } : {}) },
+        deps,
+      );
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      const run = deps.store.calls.find(
+        ([name, args]) => name === 'recordSensorRun' && args.sensorId === 'type-check',
+      );
+      return run?.[1] ?? null;
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  };
+
+  it('reads no stage deadline for an unpinned run, whatever is left of the wall clock', async () => {
+    // 60 s left against a 600 s authored budget is exactly the case the
+    // release-mode bound would shorten; -1 ms is an already-expired stage.
+    for (const stageBudgetMs of [60_000, -1]) {
+      const run = await budgetedSensorRun({ stageBudgetMs });
+      expect(run, `stageBudgetMs=${stageBudgetMs}`).toMatchObject({
+        result: 'PASS',
+        held: false,
+      });
+      expect(run.detail).not.toHaveProperty('boundedBy');
+      expect(run.detail).not.toHaveProperty('timeoutMs');
+      expect(run.detail).not.toHaveProperty('stageBudgetExhausted');
+    }
+  });
+
+  it('shortens a pinned sensor to what is left of the stage', async () => {
+    const run = await budgetedSensorRun({
+      methodologyRelease: { releaseId: 'release-a' },
+      stageBudgetMs: 60_000,
+    });
+    expect(run.detail).toMatchObject({ boundedBy: 'stage-deadline' });
+    expect(run.detail.timeoutMs).toBeLessThanOrEqual(60_000);
+  });
+
+  it('launches no pinned sensor child once the stage budget is gone', async () => {
+    const run = await budgetedSensorRun({
+      methodologyRelease: { releaseId: 'release-a' },
+      stageBudgetMs: -1,
+    });
+    expect(run).toMatchObject({ result: 'BLOCKED', held: false });
+    expect(run.detail).toMatchObject({ stageBudgetExhausted: true });
+  });
+
+  it('preserves a 2.3.3-pinned sensor pass even when the stage budget is spent', async () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL(
+          '../../shared/test/fixtures/aidlc-compatibility/current-stable.json',
+          import.meta.url,
+        ),
+        'utf8',
+      ),
+    );
+    const { blocks } = buildFromFiles(
+      filesFromCompatibilityFixture({ profileId: 'current-stable', fixture }),
+    );
+    const lib = libWithScriptSensor();
+    lib.fromRelease = true;
+    lib.sensorsById = Object.fromEntries(
+      blocks.filter((b) => b.type === 'SENSOR').map((b) => [b.id, b]),
+    );
+    lib.scopesById = Object.fromEntries(
+      blocks.filter((b) => b.type === 'SCOPE').map((b) => [b.id, b]),
+    );
+    const { plan } = buildExecutionPlan({ workflow: workflow(), scope: 'feature', library: lib });
+    expect(plan.stages[0].policy ?? null).toBeNull();
+    const methodologyRelease = { releaseId: 'aidlc-2.3.3' };
+    const spawned = [];
+    const baseline = await budgetedSensorRun({
+      methodologyRelease,
+      sensorLibrary: lib,
+      stageBudgetMs: 600_000,
+      spawned,
+    });
+    expect(baseline).toMatchObject({ result: 'PASS', held: false });
+    expect(baseline.detail).toEqual({
+      scope: 'project',
+      applicability: 'UNKNOWN',
+      provenance: { state: 'unknown', reason: 'no_repository_results' },
+      files: [{ file: 'a.ts', result: 'PASS', timedOut: false, detail: { pass: true } }],
+    });
+    expect(spawned).toEqual([
+      { file: 'bun', args: ['--stage', 'requirements-analysis', '--file-path', 'a.ts'] },
+    ]);
+    for (const stageBudgetMs of [1_000, -1]) {
+      const actualSpawns = [];
+      const actual = await budgetedSensorRun({
+        methodologyRelease,
+        sensorLibrary: lib,
+        stageBudgetMs,
+        spawned: actualSpawns,
+      });
+      expect(actual, `stageBudgetMs=${stageBudgetMs}`).toEqual(baseline);
+      expect(actualSpawns).toEqual(spawned);
+    }
+  });
+
+  it('ignores authored policy deadlines outside a pinned run', async () => {
+    const lib = libWithScriptSensor();
+    lib.fromRelease = true;
+    lib.scopesById = { feature: { id: 'feature', sensorsPolicy: 'on' } };
+    const spawned = [];
+    const run = await budgetedSensorRun({ sensorLibrary: lib, stageBudgetMs: -1, spawned });
+    expect(run).toMatchObject({ result: 'PASS', held: false });
+    expect(spawned).toHaveLength(1);
+    expect(run.detail).not.toHaveProperty('boundedBy');
+    expect(run.detail).not.toHaveProperty('timeoutMs');
+    expect(run.detail).not.toHaveProperty('stageBudgetExhausted');
+  });
+
+  it.each([false, true])(
+    'uses the authored policy at the gate sensor pass: policy=%s',
+    async (policy) => {
+      const lib = libWithScriptSensor();
+      lib.fromRelease = true;
+      lib.sensorsById['type-check'].fireOn = 'gate';
+      if (policy) lib.scopesById = { feature: { id: 'feature', sensorsPolicy: 'on' } };
+      const spawned = [];
+      const run = await budgetedSensorRun({
+        methodologyRelease: { releaseId: 'custom-catalog' },
+        sensorLibrary: lib,
+        stageBudgetMs: -1,
+        spawned,
+      });
+      expect(run).toMatchObject({ result: policy ? 'BLOCKED' : 'PASS', held: false });
+      expect(spawned).toHaveLength(policy ? 0 : 1);
+      if (policy) expect(run.detail.stageBudgetExhausted).toBe(true);
+      else expect(run.detail).not.toHaveProperty('stageBudgetExhausted');
+    },
+  );
+});
+
 // The artifact-head observation the orchestrator turns into
 // `required_artifact_missing`. "Observed nothing" and "could not observe" are
 // different facts, and the stage result must say which one happened: an empty
@@ -7638,5 +7830,81 @@ describe('runStage — produced-head observation', () => {
 
     expect(res).not.toHaveProperty('producedHeads');
     expect(res).not.toHaveProperty('producedHeadsUnavailable');
+  });
+});
+
+// Which sensors the intent's release is asked for a script closure. The
+// reader is bound to the resolved library's provenance, so an immutable user
+// SENSOR overlay — whose script may legitimately import the project's own
+// checked-out code — keeps the existing user-script path instead of being
+// reported as corruption of a release that never owned it.
+describe('runStage — the release closure a pinned sensor is read for', () => {
+  // `type-check` declares the stdout-json verdict protocol, so the stub child
+  // prints a verdict the way the real script does.
+  const okSpawn = () => ({
+    stdout: {
+      on: (ev, cb) => ev === 'data' && setImmediate(() => cb(Buffer.from('{"pass":true}'))),
+    },
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  const libWithScriptSensor = () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].sensors = ['type-check'];
+    lib.sensorsById = {
+      'type-check': {
+        id: 'type-check',
+        command: 'bun <runtime-managed>/tools/aidlc-sensor-type-check.ts',
+        runtime: 'bun',
+        severity: 'advisory',
+        matches: '**/*.ts',
+        scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
+      },
+    };
+    return lib;
+  };
+
+  const PROJECT_IMPORT = 'import { ok } from "../../src/helper.ts";\nconsole.log(ok);\n';
+  const PIN = {
+    releaseId: 'release-a',
+    sourceSha: 'a'.repeat(40),
+    closureDigest: 'b'.repeat(64),
+  };
+
+  const pinnedSensorRun = async ({ tenantId = null }) => {
+    const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-sensor-closure-'));
+    await writeFile(nodePath.join(workspaceDir, 'a.ts'), 'export const value = 1;');
+    const lib = libWithScriptSensor();
+    if (tenantId) lib.sensorsById['type-check'].tenantId = tenantId;
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+      loadBlockScript: async () => PROJECT_IMPORT,
+    });
+    try {
+      const res = await runStage({ ...baseArgs, workspaceDir, methodologyRelease: PIN }, deps);
+      const run = deps.store.calls.find(
+        ([name, args]) => name === 'recordSensorRun' && args.sensorId === 'type-check',
+      );
+      return { res, run: run?.[1] ?? null };
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  };
+
+  it('is not read for a user overlay, whose script runs as it did before', async () => {
+    const { res, run } = await pinnedSensorRun({ tenantId: 'default' });
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(run).toMatchObject({ result: 'PASS', held: false });
+  });
+
+  it('is read for the release\u2019s own sensor, and holds the stage when it cannot be', async () => {
+    const { res, run } = await pinnedSensorRun({});
+    expect(res).toMatchObject({ ok: false, reason: 'sensor_blocked' });
+    expect(run).toMatchObject({
+      result: 'BLOCKED',
+      held: true,
+      detail: { releaseIntegrityFailure: true },
+    });
   });
 });

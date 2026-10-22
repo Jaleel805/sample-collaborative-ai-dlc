@@ -33,10 +33,17 @@ import {
   unhandledCapabilities,
 } from './aidlc-capabilities.js';
 import { compileStageGraph, compileRules } from './compile.js';
-import { validateSensorContractFields } from './v2-sensor-contract.js';
 import { isLoopBackRecommenderStage, loopBackApplies } from './stage-loopback.js';
 import { constructionAutonomyApplies } from './construction-autonomy.js';
 import { stageSkipBlockReason } from './stage-skip.js';
+import {
+  FILE_PATH_FLAG,
+  recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
+  sensorKind,
+  sensorPathFlag,
+  validateSensorContractFields,
+} from './v2-sensor-contract.js';
 import { SYSTEM_TENANT } from './tenant.js';
 import { scopeAidlcSettings } from './intent-aidlc-settings.js';
 
@@ -267,7 +274,13 @@ const stageInputs = (stage) =>
 
 // Resolve + validate the deterministic sensors a stage runs. The reviewer is a
 // SEPARATE axis (stage.reviewer), handled below — it is NOT a sensor here.
-const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = false } = {}) =>
+const resolveSensors = (
+  stage,
+  stageId,
+  sensorsById,
+  errors,
+  { policyEnabled = false, recordTimestampExempt = false } = {},
+) =>
   (stage?.sensors ?? [])
     .map((sid) => {
       const sensor = sensorsById[sid];
@@ -297,6 +310,10 @@ const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = f
           }),
         );
       }
+      const pathFlag =
+        sensorKind({ sensorId: sid, runtime: sensor.runtime }) === 'script'
+          ? sensorPathFlag(sensor.inputSchema)
+          : FILE_PATH_FLAG;
       return {
         sensorId: sid,
         severity: sensor.severity ?? 'advisory',
@@ -306,6 +323,12 @@ const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = f
         category: sensor.category ?? null,
         matches: sensor.matches ?? null,
         scriptRef: sensor.scriptRef ?? null,
+        // The path flag a script sensor's `input_schema` asks for, resolved here
+        // so the runtime never has to guess it from the sensor's id. Emitted
+        // ONLY when the authored contract moves the flag off the default, so a
+        // catalog that authors no contract — and a graph sensor, which takes no
+        // path at all — keeps its plan byte-identical.
+        ...(pathFlag === FILE_PATH_FLAG ? {} : { pathFlag }),
         // Preserve legacy plan byte identity. The runner applies defaults for
         // absent fields; authored values still cross this validated boundary.
         ...Object.fromEntries(
@@ -317,6 +340,19 @@ const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = f
         // has no gate plane and runs every sensor in its one pass, so a SYSTEM
         // seed or a user block that authors the field must not change its plan.
         ...(policyEnabled && sensor.fireOn ? { fireOn: sensor.fireOn } : {}),
+        // The exit-code contract this catalog authors for the script behind the
+        // sensor, read from the invocation it declares. Emitted ONLY when the
+        // catalog routes the sensor through its own engine dispatcher AND the
+        // run is release-pinned, so an unpinned run — which has no release
+        // dispatcher to stand in for — and every catalog that invokes its
+        // scripts directly keep a byte-identical plan.
+        ...(policyEnabled && sensorDeclaresDispatcherExitCodes(sensor)
+          ? { dispatcherExitCodes: true }
+          : {}),
+        // Whether this catalog's record sensors cover run records. Emitted only
+        // when they claim that coverage, so a catalog that does not keeps a
+        // byte-identical plan and keeps the heading floor.
+        ...(recordTimestampExempt ? { recordTimestampExempt: true } : {}),
       };
     })
     .filter(Boolean);
@@ -1016,7 +1052,10 @@ const buildExecutionPlan = ({
         }
       }
 
-      const sensors = resolveSensors(stage, stageId, sensorsById, errors, { policyEnabled });
+      const sensors = resolveSensors(stage, stageId, sensorsById, errors, {
+        policyEnabled,
+        recordTimestampExempt: policyEnabled && recordSensorsCoverRunRecords(sensorsById),
+      });
       const reviewer = resolveReviewer(stage, stageId, agentsById, errors);
 
       // Dependencies: every in-scope stage that must run before this one — the

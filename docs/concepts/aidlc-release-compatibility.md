@@ -262,25 +262,27 @@ checkpoint, so the annex offers only what that session has and otherwise says
 the checkpoint cannot be raised there and must be deferred to the stage's own
 session.
 
-2.11.0 is runnable but **not sensor-faithful on its own**. Three of its sensor
-behaviours are supplied by separate changes to the sensor runner, and until those
-ship a 2.11 pin runs with the following named differences:
+2.11.0's sensors run as the release declares them, with one bounded
+difference:
 
 - **Document-sensor routing and script closures.** 2.11 authors its document
   sensors against an output path and splits their scripts across sibling
-  modules. This runner passes `--file-path` and copies only the named script, so
-  the traceability, type-check and claim-sources sensors — and 2.11's linter,
-  whose `aidlc-runtime-budget.ts` import makes it the first 2.11 linter that is
-  not self-contained — fail at import before they analyse anything. Every one of
-  those failures is advisory in 2.11's own catalog, so the gate reports them and
-  does not hold the stage.
-- **Code-sensor budgets.** 2.11 authors 1,200 seconds for the code sensors. This
-  runner normalizes that to a 600,000 ms ceiling and records no deadline-bound
-  provenance, so a long sensor is cut short earlier than the release asks.
-- **The timestamp-heading exemption.** 2.11 exempts a one-line timestamp heading
-  from the graph coverage check. Without that exemption the graph sensor returns
-  FAIL with zero H2s and two findings for such a document, exactly as it does for
-  2.9.0.
+  modules. The runner spawns each script on the flag its input schema declares
+  and writes the script's pinned import closure beside it before spawning, so
+  the traceability, type-check, claim-sources and linter sensors analyse their
+  input instead of failing at import. A closure or import the release store
+  cannot read is a release-integrity failure: no script is launched and the
+  stage is held.
+- **Code-sensor budgets.** 2.11 authors 1,200 seconds for the code sensors. The
+  runner honours an authored budget up to its 600-second ceiling and within the
+  stage deadline, and records which of the two bounded the run, so a sensor cut
+  at the ceiling is reported as such. This is the remaining difference: a code
+  sensor that needs more than 600 seconds is cut shorter than the release asks.
+- **The timestamp-heading exemption.** 2.11 widens its record sensors to the
+  knowledge base and exempts a one-line timestamp record from the heading
+  floor, and the runner honours that exemption for a catalog that authors it.
+  Earlier releases do not, so such a record still reports two missing headings
+  there.
 
 What these green tests do **not** prove, stated so the support claim stays
 bounded: real model behaviour under the truncated composer knowledge; live human

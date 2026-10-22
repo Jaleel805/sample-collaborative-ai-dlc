@@ -62,10 +62,159 @@ const ALLOWED_SCRIPT_RUNTIMES = Object.freeze(['bun', 'node', 'sh']);
 const MAX_TIMEOUT_SECONDS = 600;
 const DEFAULT_TIMEOUT_SECONDS = 30;
 
+// Which flag carries the path a script sensor analyses. A sensor's `input_schema`
+// IS its declared invocation contract, so the flag is read from the contract the
+// block authored and never from the sensor's id: a fork can ship a document
+// sensor under any name. A block that authors no schema keeps the default, which
+// is what every pre-2.8.2 catalog gets.
+const FILE_PATH_FLAG = '--file-path';
+const OUTPUT_PATH_FLAG = '--output-path';
+
+// Mirrors upstream `sensorTakesFilePath` (core/tools/aidlc-sensor.ts): a declared
+// contract decides, and only a contract that names `file_path` takes a file path.
+const sensorPathFlag = (inputSchema) => {
+  if (!inputSchema || typeof inputSchema !== 'object') return FILE_PATH_FLAG;
+  if (Object.keys(inputSchema).length === 0) return FILE_PATH_FLAG;
+  return Object.hasOwn(inputSchema, 'file_path') ? FILE_PATH_FLAG : OUTPUT_PATH_FLAG;
+};
+
 // The two sensors we evaluate in-process over graph content, by id. Everything
 // else is treated as a `script` sensor (materialize + spawn). Keyed on the
 // stable sensor id the seed assigns (basename minus `aidlc-` prefix).
 const GRAPH_SENSORS = Object.freeze(['required-sections', 'upstream-coverage', 'graph-coverage']);
+
+// A record sensor whose candidate set reaches the knowledge base also covers run
+// records, and that widening is the authored change upstream shipped the
+// timestamp exemption with, in the same sensor file. Reading the authored glob
+// of the RECORD sensors keeps the switch version-agnostic — it never reads a
+// version string — and keeps it out of reach of an unrelated sensor's glob. A
+// catalog whose record sensors claim no such coverage keeps the heading floor,
+// which is every release that shipped before the exemption.
+const RUN_RECORD_COVERAGE_MARKER = 'codekb';
+const recordSensorsCoverRunRecords = (sensorsById = {}) =>
+  GRAPH_SENSORS.some((sensorId) =>
+    String(sensorsById?.[sensorId]?.matches ?? '').includes(RUN_RECORD_COVERAGE_MARKER),
+  );
+
+// A catalog that routes a sensor through its OWN engine sensor dispatcher
+// (`{{INVOKE}} engine sensor-<id>`) authors that dispatcher's documented
+// exit-code contract for the per-sensor script behind it: exit 0 carries the
+// verdict in the stdout JSON, exit 127 is the script reporting that the tool it
+// wraps — or that tool's configuration — could not be used, and any other
+// non-zero exit is a script error that produced no verdict at all. We spawn
+// that script directly, so we stand in for the dispatcher and owe the same
+// reading of its exits. A catalog that authors a DIRECT script invocation
+// (`bun {{HARNESS_DIR}}/tools/aidlc-sensor-<id>.ts`) declares no dispatcher and
+// no reclassification, so its scripts keep the bare exit-code mapping below —
+// which is every catalog that shipped before the dispatcher route. Reading the
+// authored command keeps the switch version-agnostic: it never reads a version
+// string, exactly like the path flag read off `input_schema`.
+const DISPATCHER_SENSOR_COMMAND_RE = /\{\{INVOKE\}\}\s+engine\s+sensor-/;
+const sensorDeclaresDispatcherExitCodes = (sensor) =>
+  DISPATCHER_SENSOR_COMMAND_RE.test(String(sensor?.command ?? ''));
+
+// The exit code a per-sensor script uses to report that its tool or that tool's
+// configuration is unavailable. The dispatcher answers it with a PASS carrying a
+// tool-unavailable note, so an environment without the tool does not read as a
+// finding — the check simply did not run.
+const SCRIPT_EXIT_TOOL_UNAVAILABLE = 127;
+
+// How much of a failing script's stderr is kept on the record: enough to name
+// the breakage, bounded so a script that writes a stack trace per file cannot
+// grow the sensor row without limit.
+const STDERR_EXCERPT_LIMIT = 400;
+
+// How many DISTINCT reasons the sensor-level summary names before it counts the
+// rest. One sweep can span repositories whose tooling fails differently.
+const MAX_SUMMARIZED_REASONS = 3;
+
+const stderrExcerpt = (stderr) => {
+  const text = String(stderr ?? '').trim();
+  if (text.length <= STDERR_EXCERPT_LIMIT) return text;
+  return `${text.slice(0, STDERR_EXCERPT_LIMIT)}…`;
+};
+
+// The first line a per-sensor script writes to stderr before exiting is its own
+// marker (`eslint-unavailable`, `no-eslint-config`, `tsc-unavailable`, …), and
+// it is the ONLY place the missing tool or configuration is named — the
+// dispatcher's own note is the bare string `tool-unavailable`. Reading the
+// marker keeps the reason specific without the runtime knowing any sensor's
+// tool, and an unrecognised marker is still quoted rather than dropped.
+const firstStderrLine = (stderr) =>
+  String(stderr ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line !== '') ?? '';
+
+const MISSING_CONFIG_MARKER_RE = /^no-([\w.-]+)-config$/;
+const UNAVAILABLE_TOOL_MARKER_RE = /^([\w.-]+)-unavailable$/;
+
+const toolUnavailableReason = (stderr) => {
+  const marker = firstStderrLine(stderr);
+  const missingConfig = MISSING_CONFIG_MARKER_RE.exec(marker);
+  if (missingConfig) {
+    return `no ${missingConfig[1]} configuration was found, so the check did not run`;
+  }
+  const unavailableTool = UNAVAILABLE_TOOL_MARKER_RE.exec(marker);
+  if (unavailableTool) {
+    return `${unavailableTool[1]} is not available here, so the check did not run`;
+  }
+  return marker
+    ? `the sensor reported its tool unavailable ("${marker}"), so the check did not run`
+    : 'the sensor reported its tool unavailable, so the check did not run';
+};
+
+// Map ONE non-zero child exit to a verdict under the authored contract. Exit 0
+// is not routed here — the script printed a verdict and that verdict decides —
+// and neither is a timeout or a spawn failure, which produce no exit code.
+//
+// Only the tool-unavailable exit changes a verdict, because only that exit was
+// being read as a finding when the script was reporting it had not run. Every
+// other non-zero exit keeps the verdict the bare mapping already gave it and
+// gains only the detail that was missing: the exit code and a bounded stderr
+// excerpt. So a script error stays the FAIL it was, and the one exit the bare
+// mapping already calls inconclusive stays inconclusive.
+const resultFromDispatcherExit = ({ exitCode, stderr } = {}) => {
+  if (exitCode === SCRIPT_EXIT_TOOL_UNAVAILABLE) {
+    return {
+      result: SENSOR_RESULT.PASS,
+      detail: { toolUnavailable: true, exitCode, reason: toolUnavailableReason(stderr) },
+    };
+  }
+  const excerpt = stderrExcerpt(stderr);
+  return {
+    result: resultFromExit(exitCode),
+    detail: {
+      scriptError: true,
+      exitCode,
+      reason: `the sensor script exited ${exitCode} without a verdict`,
+      ...(excerpt ? { stderr: excerpt } : {}),
+    },
+  };
+};
+
+// The gate finding and the activity note read the SENSOR-level `detail.reason`,
+// not the per-file rows, so a sweep that only reached tool-unavailable passes —
+// or script errors that produced no verdict — has to say so there as well. That
+// is the path a human sees; without it the verdict carries no reason at all.
+const dispatcherExitReason = (fileResults = [], total = 0) => {
+  const reasons = [];
+  let affected = 0;
+  for (const row of fileResults) {
+    const detail = row?.detail;
+    if (!detail?.reason) continue;
+    if (detail.toolUnavailable !== true && detail.scriptError !== true) continue;
+    affected += 1;
+    if (!reasons.includes(detail.reason)) reasons.push(detail.reason);
+  }
+  if (reasons.length === 0) return null;
+  const shown = reasons.slice(0, MAX_SUMMARIZED_REASONS);
+  const rest = reasons.length - shown.length;
+  return `${affected} of ${total} files: ${shown.join('; ')}${rest > 0 ? ` (+${rest} more)` : ''}`;
+};
+
+// The run-record naming convention: `<artifact>-timestamp[.md]`.
+const TIMESTAMP_MARKER_RE = /-timestamp(?:\.md)?$/;
 
 // Classify a resolved sensor into its execution kind. A sensor whose id is one
 // of the graph evaluators runs in-process; otherwise it is a script sensor that
@@ -90,7 +239,8 @@ const severityGate = (result, severity, applicability = SENSOR_APPLICABILITY.APP
   return { continues: true, held: false };
 };
 
-const TOOL_UNAVAILABLE_EXIT = 127;
+// The same code under the name the provenance work introduced.
+const TOOL_UNAVAILABLE_EXIT = SCRIPT_EXIT_TOOL_UNAVAILABLE;
 const SENSOR_VERDICT_MODES = Object.freeze(['stdout-json', 'exit-code']);
 const STDOUT_JSON_SENSORS = Object.freeze(['linter', 'type-check']);
 const SENSOR_SCOPES = Object.freeze(['file', 'project']);
@@ -176,6 +326,31 @@ const sensorVerdictMode = (sensor) => validateSensorContractFields(sensor).field
 const sensorScope = (sensor) => validateSensorContractFields(sensor).fields.scope;
 const projectConfigFile = (sensor) => validateSensorContractFields(sensor).fields.projectConfig;
 
+// The bound that governs ONE child launch, and which of the three set it.
+//
+// `remainingStageMs` is what is left of the stage's wall-clock budget. Three
+// states, deliberately distinguished:
+//   - not a finite number — no deadline is available (an unpinned run, or a
+//     caller that reads no deadline): the authored budget stands;
+//   - greater than zero — the budget may narrow the authored one;
+//   - zero or less — the budget is EXHAUSTED. That is NOT "unavailable": the
+//     stage is already past its deadline, so nothing further may be launched.
+// The caller re-reads the remaining budget before each launch, because a sensor
+// matching several files must not hand every one of them the allowance the
+// first one found.
+const scriptTimeoutBound = (authoredSeconds, remainingStageMs = null) => {
+  const base =
+    authoredSeconds > MAX_TIMEOUT_SECONDS
+      ? { timeoutMs: MAX_TIMEOUT_SECONDS * 1000, boundedBy: 'ceiling' }
+      : { timeoutMs: authoredSeconds * 1000, boundedBy: 'authored' };
+  if (!Number.isFinite(remainingStageMs)) return { ...base, exhausted: false };
+  if (remainingStageMs <= 0) return { timeoutMs: 0, boundedBy: 'stage-deadline', exhausted: true };
+  if (remainingStageMs < base.timeoutMs) {
+    return { timeoutMs: remainingStageMs, boundedBy: 'stage-deadline', exhausted: false };
+  }
+  return { ...base, exhausted: false };
+};
+
 // Validate + normalize a script-sensor's run spec, or return an error. Mirrors
 // the old v2-script-contract: `command` is SERVER-CONTROLLED (from the block),
 // never agent input. The returned spec is the ONLY thing the runner executes.
@@ -198,13 +373,22 @@ const validateScriptSpec = (sensor) => {
   const contract = validateSensorContractFields(sensor);
   if (!contract.ok) return { ok: false, error: contract.errors[0].message };
 
+  // The authored budget, clamped by the ceiling. The stage deadline is applied
+  // per child launch by the runner, not here: a spec is validated once but a
+  // sensor can launch a child per matching file, minutes apart.
+  const bound = scriptTimeoutBound(seconds);
   return {
     ok: true,
     spec: {
       sensorId: sensor.sensorId ?? sensor.id ?? null,
       runtime,
       command: sensor.command,
-      timeoutMs: Math.min(seconds, MAX_TIMEOUT_SECONDS) * 1000,
+      pathFlag: sensor.pathFlag ?? sensorPathFlag(sensor.inputSchema),
+      timeoutSeconds: seconds,
+      // `scriptTimeoutBound` already applies the MAX_TIMEOUT_SECONDS ceiling
+      // that main clamped inline here.
+      timeoutMs: bound.timeoutMs,
+      boundedBy: bound.boundedBy,
       ...contract.fields,
     },
   };
@@ -254,6 +438,12 @@ const buildScriptArgv = (spec, { scriptPath, substitutions = {} } = {}) => {
 // not code).
 const evalRequiredSections = (body = '', name = '', options = {}) => {
   const strictStructuredBlocks = Boolean(options.strictStructuredBlocks);
+  // A `<artifact>-timestamp` marker is a run record, not a document: the
+  // methodology specifies a single `Discovered: ...` line, so the heading floor
+  // reported two findings on every to-spec file. A `*-questions` marker keeps
+  // the floor, because each question is its own `##` section.
+  const timestampMarker =
+    Boolean(options.recordTimestampExempt) && TIMESTAMP_MARKER_RE.test(String(name));
   const seen = new Set();
   const headings = [];
   for (const raw of String(body).split(/\r?\n/)) {
@@ -264,8 +454,8 @@ const evalRequiredSections = (body = '', name = '', options = {}) => {
     headings.push(line);
   }
   const h2Count = headings.length;
-  let pass = h2Count >= 2;
-  let findingsCount = Math.max(0, 2 - h2Count);
+  let pass = timestampMarker || h2Count >= 2;
+  let findingsCount = timestampMarker ? 0 : Math.max(0, 2 - h2Count);
   const detail = { h2_count: h2Count, headings };
 
   // The machine-readable DAG check fires for the unit-of-work-dependency
@@ -558,10 +748,19 @@ export {
   sensorScope,
   projectConfigFile,
   GRAPH_SENSORS,
+  FILE_PATH_FLAG,
+  OUTPUT_PATH_FLAG,
+  recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
+  SCRIPT_EXIT_TOOL_UNAVAILABLE,
   sensorKind,
+  sensorPathFlag,
+  scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -583,10 +782,19 @@ export default {
   sensorScope,
   projectConfigFile,
   GRAPH_SENSORS,
+  FILE_PATH_FLAG,
+  OUTPUT_PATH_FLAG,
+  recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
+  SCRIPT_EXIT_TOOL_UNAVAILABLE,
   sensorKind,
+  sensorPathFlag,
+  scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
