@@ -493,19 +493,57 @@ const parsePageNumber = (raw) => {
 // Provider methods
 // ---------------------------------------------------------------------------
 
-const listExternalProjects = async ({ ddb, ssm, secrets, userId }) => {
-  const ctx = await buildContext({ ddb, ssm, secrets, userId });
-  const r = await jiraFetch(ctx, '/rest/api/3/project/search?maxResults=100');
+// The project picker filters this list client-side, so it must hold every
+// project the user can see, not just the first page: a large site has
+// hundreds, and Product Discovery projects were among those cut off. Capped so
+// a huge site still answers inside the API Gateway 29s limit.
+const PROJECT_PAGE_SIZE = 100;
+const PROJECT_MAX_RESULTS = 2000;
+
+const fetchProjectPage = async (ctx, startAt) => {
+  const params = new URLSearchParams({
+    startAt: String(startAt),
+    maxResults: String(PROJECT_PAGE_SIZE),
+    orderBy: 'name',
+  });
+  const r = await jiraFetch(ctx, `/rest/api/3/project/search?${params.toString()}`);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     throw new ProviderError(r.status, data.errorMessages?.[0] || 'Failed to list Jira projects');
   }
   const values = Array.isArray(data.values) ? data.values : [];
-  return values.map((p) => ({
-    key: p.key,
-    name: p.name,
-    displayKey: p.key,
-  }));
+  return {
+    projects: values.map((p) => ({
+      key: p.key,
+      name: p.name,
+      displayKey: p.key,
+      // software, business, service_desk or product_discovery.
+      projectTypeKey: p.projectTypeKey,
+    })),
+    total: Number.isFinite(data.total) ? data.total : null,
+    isLast:
+      values.length === 0 ||
+      (typeof data.isLast === 'boolean' ? data.isLast : values.length < PROJECT_PAGE_SIZE),
+  };
+};
+
+// Page 1 goes first and alone: it settles any 401 token refresh (Atlassian
+// rotates refresh tokens, so parallel refreshes would race) and its `total`
+// bounds the rest, which are fetched in parallel. Jira may return fewer than
+// maxResults per page, so later offsets step by what page 1 actually held.
+const listExternalProjects = async ({ ddb, ssm, secrets, userId }) => {
+  const ctx = await buildContext({ ddb, ssm, secrets, userId });
+  const first = await fetchProjectPage(ctx, 0);
+  if (first.isLast) return first.projects;
+  const step = first.projects.length;
+  const end = Math.min(first.total ?? PROJECT_MAX_RESULTS, PROJECT_MAX_RESULTS);
+  const offsets = [];
+  for (let startAt = step; startAt < end; startAt += step) offsets.push(startAt);
+  const rest = await Promise.all(offsets.map((startAt) => fetchProjectPage(ctx, startAt)));
+  const seen = new Set();
+  return [first, ...rest]
+    .flatMap((p) => p.projects)
+    .filter((p) => !seen.has(p.key) && seen.add(p.key));
 };
 
 const listIssues = async ({ ddb, ssm, secrets, userId }, projectKey, opts = {}) => {
