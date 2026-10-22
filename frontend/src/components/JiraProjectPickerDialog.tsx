@@ -33,6 +33,11 @@ const PROJECT_TYPE_LABEL: Record<string, string> = {
   product_discovery: 'Product Discovery',
 };
 
+const matchesFilter = (project: ExternalProject, filter: string) => {
+  const f = filter.trim().toLowerCase();
+  return !f || project.name.toLowerCase().includes(f) || project.key.toLowerCase().includes(f);
+};
+
 export function JiraProjectPickerDialog({ open, onOpenChange, onConfirm }: Props) {
   const meta = getTrackerProvider('jira-cloud');
   const [projects, setProjects] = useState<ExternalProject[]>([]);
@@ -42,13 +47,18 @@ export function JiraProjectPickerDialog({ open, onOpenChange, onConfirm }: Props
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
 
-  const visible = useMemo(() => {
-    const f = filter.trim().toLowerCase();
-    if (!f) return projects;
-    return projects.filter(
-      (p) => p.name.toLowerCase().includes(f) || p.key.toLowerCase().includes(f),
-    );
-  }, [projects, filter]);
+  const visible = useMemo(
+    () => projects.filter((p) => matchesFilter(p, filter)),
+    [projects, filter],
+  );
+
+  // A selection the search hides is cleared, so Add never submits a project
+  // the user can no longer see.
+  const changeFilter = (value: string) => {
+    setFilter(value);
+    const chosen = projects.find((p) => p.key === chosenKey);
+    if (chosen && !matchesFilter(chosen, value)) setChosenKey(null);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -105,7 +115,7 @@ export function JiraProjectPickerDialog({ open, onOpenChange, onConfirm }: Props
         {!loading && !error && projects.length > 0 && (
           <Input
             value={filter}
-            onChange={(e) => setFilter(e.target.value)}
+            onChange={(e) => changeFilter(e.target.value)}
             placeholder={`Search ${projects.length} projects by name or key…`}
             aria-label="Search Jira projects"
             autoFocus

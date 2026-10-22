@@ -495,10 +495,11 @@ const parsePageNumber = (raw) => {
 
 // The project picker filters this list client-side, so it must hold every
 // project the user can see, not just the first page: a large site has
-// hundreds, and Product Discovery projects were among those cut off. Capped so
-// a huge site still answers inside the API Gateway 29s limit.
+// hundreds. Capped on both results and requests so a huge site still answers
+// inside the API Gateway 29s limit.
 const PROJECT_PAGE_SIZE = 100;
 const PROJECT_MAX_RESULTS = 2000;
+const PROJECT_MAX_REQUESTS = 40;
 
 const fetchProjectPage = async (ctx, startAt) => {
   const params = new URLSearchParams({
@@ -512,6 +513,18 @@ const fetchProjectPage = async (ctx, startAt) => {
     throw new ProviderError(r.status, data.errorMessages?.[0] || 'Failed to list Jira projects');
   }
   const values = Array.isArray(data.values) ? data.values : [];
+  // Jira may apply a smaller limit than requested and may omit isLast, so
+  // completion comes from this response's own metadata.
+  const pageStart = Number.isFinite(data.startAt) ? data.startAt : startAt;
+  const next = pageStart + values.length;
+  const total = Number.isFinite(data.total) ? data.total : null;
+  const limit = Number.isFinite(data.maxResults) ? data.maxResults : PROJECT_PAGE_SIZE;
+  let isLast;
+  if (values.length === 0) isLast = true;
+  else if (typeof data.isLast === 'boolean') isLast = data.isLast;
+  else if (total !== null) isLast = next >= total;
+  else if (data.nextPage) isLast = false;
+  else isLast = values.length < limit;
   return {
     projects: values.map((p) => ({
       key: p.key,
@@ -520,30 +533,30 @@ const fetchProjectPage = async (ctx, startAt) => {
       // software, business, service_desk or product_discovery.
       projectTypeKey: p.projectTypeKey,
     })),
-    total: Number.isFinite(data.total) ? data.total : null,
-    isLast:
-      values.length === 0 ||
-      (typeof data.isLast === 'boolean' ? data.isLast : values.length < PROJECT_PAGE_SIZE),
+    next,
+    isLast,
   };
 };
 
-// Page 1 goes first and alone: it settles any 401 token refresh (Atlassian
-// rotates refresh tokens, so parallel refreshes would race) and its `total`
-// bounds the rest, which are fetched in parallel. Jira may return fewer than
-// maxResults per page, so later offsets step by what page 1 actually held.
+// Pages are fetched one at a time, each continuing from where the previous
+// response ended. Sequential requests also keep any 401 token refresh single
+// (Atlassian rotates refresh tokens, so parallel refreshes would race).
 const listExternalProjects = async ({ ddb, ssm, secrets, userId }) => {
   const ctx = await buildContext({ ddb, ssm, secrets, userId });
-  const first = await fetchProjectPage(ctx, 0);
-  if (first.isLast) return first.projects;
-  const step = first.projects.length;
-  const end = Math.min(first.total ?? PROJECT_MAX_RESULTS, PROJECT_MAX_RESULTS);
-  const offsets = [];
-  for (let startAt = step; startAt < end; startAt += step) offsets.push(startAt);
-  const rest = await Promise.all(offsets.map((startAt) => fetchProjectPage(ctx, startAt)));
+  const projects = [];
   const seen = new Set();
-  return [first, ...rest]
-    .flatMap((p) => p.projects)
-    .filter((p) => !seen.has(p.key) && seen.add(p.key));
+  let startAt = 0;
+  for (let request = 0; request < PROJECT_MAX_REQUESTS; request += 1) {
+    const page = await fetchProjectPage(ctx, startAt);
+    for (const project of page.projects) {
+      if (seen.has(project.key)) continue;
+      seen.add(project.key);
+      projects.push(project);
+    }
+    if (page.isLast || projects.length >= PROJECT_MAX_RESULTS || page.next <= startAt) break;
+    startAt = page.next;
+  }
+  return projects.slice(0, PROJECT_MAX_RESULTS);
 };
 
 const listIssues = async ({ ddb, ssm, secrets, userId }, projectKey, opts = {}) => {

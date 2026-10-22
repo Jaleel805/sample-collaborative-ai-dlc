@@ -693,6 +693,62 @@ describe('jira-cloud — provider methods', () => {
       expect(projects).toHaveLength(2000);
     });
 
+    it('follows each response when Jira lowers the page size after page 1', async () => {
+      fetchMock.mockImplementation(async (url) => {
+        const startAt = Number(new URL(url).searchParams.get('startAt'));
+        const limit = startAt === 0 ? 100 : 50;
+        const count = Math.min(limit, 230 - startAt);
+        return projectPage(startAt, count, {
+          startAt,
+          maxResults: limit,
+          total: 230,
+          isLast: startAt + count >= 230,
+        });
+      });
+      const projects = await jiraProvider.listExternalProjects(ctx());
+      expect(new Set(projects.map((p) => p.key)).size).toBe(230);
+      expect(projects.map((p) => p.key)).toContain('P150');
+      expect(fetchMock.mock.calls.map(startAtOf)).toEqual([0, 100, 150, 200]);
+    });
+
+    it('continues past a short page that has a continuation but no isLast', async () => {
+      fetchMock.mockImplementation(async (url) => {
+        const startAt = Number(new URL(url).searchParams.get('startAt'));
+        const count = Math.min(50, 230 - startAt);
+        return projectPage(startAt, count, {
+          startAt,
+          maxResults: 50,
+          total: 230,
+          ...(startAt + count < 230 && {
+            nextPage: `https://jira/next?startAt=${startAt + count}`,
+          }),
+        });
+      });
+      const projects = await jiraProvider.listExternalProjects(ctx());
+      expect(projects).toHaveLength(230);
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+    });
+
+    it('stops when a later page reports completion without a total', async () => {
+      fetchMock
+        .mockResolvedValueOnce(projectPage(0, 100, { isLast: false }))
+        .mockResolvedValueOnce(projectPage(100, 40, { isLast: true }));
+      const projects = await jiraProvider.listExternalProjects(ctx());
+      expect(projects).toHaveLength(140);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('caps results at 2,000 when the page size does not divide it', async () => {
+      fetchMock.mockImplementation(async (url) => {
+        const startAt = Number(new URL(url).searchParams.get('startAt'));
+        return projectPage(startAt, 60, { startAt, maxResults: 60, isLast: false });
+      });
+      const projects = await jiraProvider.listExternalProjects(ctx());
+      expect(projects).toHaveLength(2000);
+      expect(projects.at(-1).key).toBe('P1999');
+      expect(fetchMock).toHaveBeenCalledTimes(34);
+    });
+
     it('surfaces a Jira error body', async () => {
       fetchMock.mockResolvedValueOnce(errResponse(403, { errorMessages: ['No access'] }));
       await expect(jiraProvider.listExternalProjects(ctx())).rejects.toMatchObject({
