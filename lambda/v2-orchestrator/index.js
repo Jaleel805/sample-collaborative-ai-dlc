@@ -43,7 +43,7 @@ import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { createProcessStore } from '../shared/v2-process-store.js';
 import { eventTypeOf } from '../shared/v2-process-keys.js';
 import { loadExecutionPlan } from '../shared/v2-workflow-plan.js';
-import { intentMethodologyOptions } from '../shared/intent-methodology.js';
+import { intentMethodologyOptions, planProjectionOptions } from '../shared/intent-methodology.js';
 import {
   planSegments,
   stageInstanceId as planStageInstanceId,
@@ -693,9 +693,15 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
       loadPlan({
         workflowId,
         workflowVersion,
-        scope,
-        ...(intentSkipIds.length ? { skipStageIds: intentSkipIds } : {}),
-        ...(composedGrid ? { composedGrid } : {}),
+        // ONE projection contract with the intents API and the container (see
+        // shared/intent-methodology.js): the scope, the skip overlay, the grid
+        // and the per-intent AI-DLC settings all come from the same list, so a
+        // recorded setting cannot be validated at create and then dropped here.
+        ...planProjectionOptions(meta, {
+          scope,
+          ...(intentSkipIds.length ? { skipStageIds: intentSkipIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+        }),
         ...intentMethodologyOptions(meta, { s3, bucket: ARTIFACTS_BUCKET }),
       }),
     );
@@ -900,9 +906,16 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         ...(meta.aidlcRepoRef ? { aidlcRepoRef: meta.aidlcRepoRef } : {}),
         ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
         ...(meta.methodologyRelease ? { methodologyRelease: meta.methodologyRelease } : {}),
-        scope,
-        ...(allSkipIds.length ? { skipStageIds: allSkipIds } : {}),
-        ...(composedGrid ? { composedGrid } : {}),
+        // The container resolves its OWN plan, so the WHOLE projection rides
+        // the dispatch — built from the same shared contract the walk and the
+        // intents API use (shared/intent-methodology.js), not from a parallel
+        // argument list. That list is how the base scope of a customized run,
+        // and the settings before it, reached the walk and missed the stage.
+        ...planProjectionOptions(meta, {
+          scope,
+          ...(allSkipIds.length ? { skipStageIds: allSkipIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+        }),
         cliModels,
         tierModels,
         requestedCli,
@@ -2516,6 +2529,14 @@ const runStage = async (
     skipStageIds = null,
     // Per-intent composed grid — forwarded for the same plan-parity reason.
     composedGrid = null,
+    // Per-intent AI-DLC settings — forwarded for the same plan-parity reason:
+    // the container resolves its own plan and must resolve the same policy.
+    intentSettings = null,
+    // The stock scope a composed grid runs on — forwarded for the same reason.
+    // A grid's `scope` names no SCOPE block, so a dispatch without this
+    // resolves no policy at all in the container while the walk resolved the
+    // base scope's.
+    policyScope = null,
     cliModels,
     tierModels = null,
     requestedCli,
@@ -2586,6 +2607,8 @@ const runStage = async (
         scope,
         ...(skipStageIds?.length ? { skipStageIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
+        ...(policyScope ? { policyScope } : {}),
+        ...(intentSettings ? { intentSettings } : {}),
         ...(cliModels ? { cliModels } : {}),
         ...(tierModels ? { tierModels } : {}),
         ...(requestedCli ? { requestedCli } : {}),
