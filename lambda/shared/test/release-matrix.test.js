@@ -606,16 +606,18 @@ describe('release coexistence matrix', () => {
     expect(declaredWithoutPolicy).toEqual([]);
   });
 
-  // No allowlisted release widens its record-sensor glob to the knowledge base,
-  // so none of them turns the run-record exemption on and a one-line timestamp
-  // record keeps reporting two missing headings on every pin that exists today.
-  it('leaves the run-record exemption off for every allowlisted release', async () => {
+  // Only a release that widens its record-sensor glob to the knowledge base
+  // turns the run-record exemption on. 2.11.0 is the first that does, so a
+  // one-line timestamp record passes there at the heading floor, and keeps
+  // reporting two missing headings on every earlier pin.
+  it('turns the run-record exemption on only for a release whose record sensor covers run records', async () => {
     const TIMESTAMP_BODY = 'Discovered: 2026-10-08T00:00:00Z\n';
     const exemptBySensor = {};
 
     for (const profileId of PROFILE_IDS) {
       const { workflow, releaseLibrary } = await fixtureContext(profileId);
-      expect(recordSensorsCoverRunRecords(releaseLibrary.sensorsById), profileId).toBe(false);
+      const covers = profileId === 'v2.11.0';
+      expect(recordSensorsCoverRunRecords(releaseLibrary.sensorsById), profileId).toBe(covers);
       const scopes = [
         ...new Set(
           workflow.placements.flatMap((placement) => Object.keys(placement.scopeMembership ?? {})),
@@ -635,20 +637,25 @@ describe('release coexistence matrix', () => {
                 recordTimestampExempt: Boolean(sensor.recordTimestampExempt),
               }),
               `${profileId}/${scope}/${stage.stageId}`,
-            ).toMatchObject({ pass: false, detail: { h2_count: 0, findings_count: 2 } });
+            ).toMatchObject(
+              covers ? { pass: true } : { pass: false, detail: { h2_count: 0, findings_count: 2 } },
+            );
           }
         }
       }
     }
 
-    expect(Object.keys(exemptBySensor).length).toBeGreaterThan(0);
-    expect(Object.values(exemptBySensor).filter(Boolean)).toEqual([]);
+    const exempt = Object.entries(exemptBySensor);
+    expect(exempt.length).toBeGreaterThan(0);
+    expect(exempt.filter(([key, on]) => on !== key.startsWith('v2.11.0/'))).toEqual([]);
+    expect(exempt.some(([key]) => key.startsWith('v2.11.0/'))).toBe(true);
   });
 
   // Every script sensor every allowlisted release runs, with the flag it is
   // spawned on and the budget it gets. A release that authors no input contract
-  // keeps `--file-path`, and every authored budget is honoured as authored — no
-  // release at or below 2.9.0 reaches the ceiling.
+  // keeps `--file-path`, and every authored budget is honoured as authored up to
+  // the ceiling — no release at or below 2.9.0 reaches it, and 2.11.0's
+  // 1200-second code sensors are clamped to it.
   it('spawns every release script sensor on its declared flag within its authored budget', async () => {
     const specsByProfile = {};
 
@@ -697,6 +704,12 @@ describe('release coexistence matrix', () => {
       'v2.7.0': [...documentSensors, ...codeSensors].toSorted(),
       'v2.8.2': [...documentSensors, ...codeSensors].toSorted(),
       'v2.9.0': [...documentSensors, ...codeSensors].toSorted(),
+      'v2.11.0': [
+        'claim-sources --output-path 300000 authored',
+        'linter --file-path 600000 ceiling',
+        'traceability --output-path 300000 authored',
+        'type-check --file-path 600000 ceiling',
+      ],
     });
   });
 });
