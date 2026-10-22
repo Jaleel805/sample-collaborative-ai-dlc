@@ -26,14 +26,25 @@ import {
 } from '../block-loader.js';
 import { buildExecutionPlan } from '../../shared/v2-execution-plan.js';
 import {
+  authoredScopeSettings,
   buildGroundingPack,
   COMPOSER_AGENT_ID,
   parseComposeProposal,
-  PROPOSAL_CONTRACT,
+  proposalContract,
 } from '../../shared/compose-match.js';
+import {
+  aidlcSettingsFromComposeProposal,
+  effectiveAidlcSettingRows,
+  scopeAidlcSettings,
+} from '../../shared/intent-aidlc-settings.js';
 import { resolveCliSelection } from './discussion-assist-start.js';
 import { closeGraphSource } from '../mcp/graph-writer.js';
-import { hasInvokeToken, INVOKE_DIALECT_ANNEX, neutralizeTokens } from '../stage-materializer.js';
+import {
+  hasInvokeToken,
+  invokeDialectAnnex,
+  invokesCheckpointLog,
+  neutralizeTokens,
+} from '../stage-materializer.js';
 
 const logger = new Logger({
   persistentKeys: { component: 'agentcore', module: 'compose-plan-start' },
@@ -67,22 +78,87 @@ const buildScopeGrounding = ({ workflow, library, scopeBlocks }) => {
   const scopes = scopeBlocks.filter((s) => offered.has(s.id ?? s.blockId));
   const summaries = {};
   const grids = {};
+  const scopeSettings = {};
   for (const scope of scopes) {
     const id = scope.id ?? scope.blockId;
     const { valid, plan } = buildExecutionPlan({ workflow, scope: id, library });
     if (valid && plan) summaries[id] = plan.summary;
     grids[id] = scopeGridFor(workflow, id);
+    const authored = authoredScopeSettings(scope);
+    if (Object.keys(authored).length > 0) scopeSettings[id] = authored;
   }
   const stages = (workflow.placements ?? [])
     .map((p) => library.stagesById[p.stageId])
     .filter(Boolean);
-  return { scopes, summaries, grids, stages, offeredScopeIds: [...offered] };
+  return { scopes, summaries, grids, stages, scopeSettings, offeredScopeIds: [...offered] };
+};
+
+// The scope whose authored settings a proposal's settings must come from, for
+// ALL THREE shapes a proposal can take:
+//
+//   matched           -> the matched stock scope IS the settings scope;
+//   custom + base     -> the explicit base scope the proposal names;
+//   custom, no base   -> the scope the selection already runs on.
+//
+// Resolving this for every mode is the point. Checking it only when an optional
+// `baseScope` happened to be present let a matched proposal, and a custom
+// proposal that omitted the member, complete with settings the draft write then
+// refused — an Apply card that says Applied over values that were silently
+// pruned.
+const settingsScopeFor = ({ proposal, policyScope = null }) =>
+  proposal.mode === 'matched' ? proposal.scope : (proposal.baseScope ?? policyScope ?? null);
+
+const scopeBlockFor = (scopeBlocks, scopeId) =>
+  scopeBlocks.find((block) => (block.id ?? block.blockId) === scopeId) ?? null;
+
+// The settings a member may accept are the ones the resolved settings scope
+// AUTHORS. Checked against the SCOPE block rather than against the proposal, so
+// the answer is the same one the draft write will give.
+const unauthoredProposalSettings = ({ proposal, scopeBlocks, settingsScope }) => {
+  const proposed = Object.keys(aidlcSettingsFromComposeProposal(proposal));
+  if (proposed.length === 0) return [];
+  const authored = scopeAidlcSettings(scopeBlockFor(scopeBlocks, settingsScope));
+  return proposed.filter((key) => !Object.hasOwn(authored, key));
 };
 
 // Validate a parsed proposal through the plan resolver — the ONLY authority.
-// Returns { validation } (authoritative verdict for a runnable proposal) or
-// { error, validation } when the proposal is not runnable.
-const validateProposal = ({ proposal, workflow, library, offeredScopeIds, strict = false }) => {
+// Returns { validation, settingsScope, settingsAuthored } (authoritative verdict
+// for a runnable proposal, with the scope its settings were checked against and
+// that scope's authored defaults) or { error, validation } when the proposal is
+// not runnable.
+const validateProposal = ({
+  proposal,
+  workflow,
+  library,
+  scopeBlocks = [],
+  offeredScopeIds,
+  policyScope = null,
+  // Whether the PINNED CATALOG authors the per-intent settings at all. Gated
+  // on the catalog, never on a version string: a release that authors none is
+  // never asked for one, so a value a model volunteers there is ignored exactly
+  // as the parser contract says — the compose row, the DTO and the outcome of
+  // an unpinned, 2.3.3, 2.8.2 or 2.9.0 compose are what they were before the
+  // settings existed.
+  settingsAware = false,
+  strict = false,
+}) => {
+  const settingsScope = settingsAware ? settingsScopeFor({ proposal, policyScope }) : null;
+  const accepted = (validation) =>
+    settingsScope
+      ? {
+          validation,
+          settingsScope,
+          settingsAuthored: scopeAidlcSettings(scopeBlockFor(scopeBlocks, settingsScope)),
+        }
+      : { validation, settingsScope };
+  const settingsError = () => {
+    if (!settingsAware) return null;
+    const unauthored = unauthoredProposalSettings({ proposal, scopeBlocks, settingsScope });
+    if (!unauthored.length) return null;
+    return settingsScope
+      ? `proposal settings ${unauthored.join(', ')} are not authored by scope "${settingsScope}"`
+      : `proposal settings ${unauthored.join(', ')} have no scope to be authored by — this selection resolves none`;
+  };
   if (proposal.mode === 'matched') {
     if (!offeredScopeIds.includes(proposal.scope)) {
       return { error: `matched scope "${proposal.scope}" is not offered by this workflow` };
@@ -93,17 +169,25 @@ const validateProposal = ({ proposal, workflow, library, offeredScopeIds, strict
       library,
     });
     const validation = { valid, errors, warnings, summary: plan?.summary ?? null };
-    return valid ? { validation } : { error: 'matched scope does not resolve', validation };
+    if (!valid) return { error: 'matched scope does not resolve', validation };
+    const unauthored = settingsError();
+    return unauthored ? { error: unauthored, validation } : accepted(validation);
+  }
+  if (settingsAware && proposal.baseScope && !offeredScopeIds.includes(proposal.baseScope)) {
+    return { error: `proposal baseScope "${proposal.baseScope}" is not offered by this workflow` };
   }
   const { valid, errors, warnings, plan } = buildExecutionPlan({
     workflow,
     scope: proposal.scope,
     library,
     composedGrid: proposal.grid,
+    ...(settingsScope ? { policyScope: settingsScope } : {}),
     strict,
   });
   const validation = { valid, errors, warnings, summary: plan?.summary ?? null };
-  return valid ? { validation } : { error: 'proposed grid does not resolve', validation };
+  if (!valid) return { error: 'proposed grid does not resolve', validation };
+  const unauthored = settingsError();
+  return unauthored ? { error: unauthored, validation } : accepted(validation);
 };
 
 const MODE_TASKS = {
@@ -123,12 +207,19 @@ const MODE_TASKS = {
   ].join('\n'),
 };
 
-// The composer persona and its knowledge are upstream methodology text and can
-// be large (the 2.6.18+ persona alone is ~46-48 KB); everything after them is
-// what the platform needs the model to act on. When the whole prompt fits, it is
-// joined in order. When it does not, the persona and knowledge are cut to the
-// space the rest leaves, so the task, the intent, the grounding and the output
-// contract reach the model. The mode task and the output contract are never cut.
+// Two sections of a compose prompt can be large and are only context: the
+// composer persona with its knowledge (upstream methodology text; the 2.6.18+
+// persona alone is ~46-48 KB) and a report excerpt of up to MAX_REPORT_EXCERPT.
+// Everything else is what the model must act on: the engine-command annex, the
+// execution-environment note, the mode task, the intent, the grounding (every
+// stock scope's run shape and the complete stage catalog) and the output
+// contract that demands a grid covering that catalog.
+//
+// When the whole prompt fits, it is joined in order. When it does not, the
+// required sections are kept whole and the two large sections share the space
+// they leave, each cut with a marker, so a catalog row is never lost to them.
+// Only when the required sections alone exceed the limit is the text before the
+// output contract cut at the limit.
 //
 // From 2.8.2 the persona invokes the upstream engine as `{{INVOKE}} engine …`,
 // and it addresses the local harness through `{{HARNESS_DIR}}`. Neither exists
@@ -138,6 +229,8 @@ const MODE_TASKS = {
 // Ends a cut persona, so the model knows the methodology text above is partial.
 export const COMPOSER_PERSONA_TRUNCATED =
   '[Composer persona and knowledge truncated here to fit the prompt budget.]';
+// Ends a cut report excerpt, for the same reason.
+export const REPORT_EXCERPT_TRUNCATED = '[Report excerpt truncated here to fit the prompt budget.]';
 
 // The upstream composer persona is written for the local AI-DLC harness: it
 // runs `detect`/`validate-grid`, writes proposal files, and must STOP when those
@@ -155,6 +248,8 @@ const PLATFORM_ENVIRONMENT = [
   '- Unavailable harness tools are never a reason to answer with mode "failed". Use "failed" only when neither a stock scope nor a custom grid can be justified from the intent and the grounding.',
 ].join('\n');
 
+const joinSections = (texts) => texts.join('\n\n');
+
 const buildComposePrompt = ({
   mode,
   persona,
@@ -165,41 +260,93 @@ const buildComposePrompt = ({
   repoSignals,
   reportExcerpt,
   progressContext,
+  // Whether the PINNED CATALOG authors the per-intent AI-DLC settings at all.
+  // Gating the richer output contract on the catalog — never on a version
+  // string — is what keeps the whole compose prompt of an unpinned, 2.3.3,
+  // 2.8.2 or 2.9.0 intent byte-identical: a release that authors no setting is
+  // asked for none and its prompt is the one it was before.
+  settingsAware = false,
 }) => {
+  const contract = proposalContract({ settingsAware });
   const head = [
     neutralizeTokens(
       persona ||
         'You are the AI-DLC composer agent: you propose workflow projections; you never route, advance, gate, or write workflow state.',
     ),
     knowledge ? neutralizeTokens(knowledge) : null,
-  ].filter(Boolean);
-  const tail = [
-    hasInvokeToken(persona, knowledge) ? INVOKE_DIALECT_ANNEX : null,
-    PLATFORM_ENVIRONMENT,
-    MODE_TASKS[mode],
-    `Intent:\n${intentPrompt || '(none provided)'}`,
-    instructions ? `Requester instructions:\n${instructions}` : null,
-    repoSignals
-      ? `Workspace signals (advisory — runtime detection is authoritative):\n${JSON.stringify(repoSignals, null, 2)}`
-      : null,
-    reportExcerpt ? `Report excerpt:\n${String(reportExcerpt).slice(0, MAX_REPORT_EXCERPT)}` : null,
-    progressContext ? `Live stage progress:\n${progressContext}` : null,
-    grounding,
   ]
     .filter(Boolean)
-    .map(String);
-  const whole = [...head, ...tail, PROPOSAL_CONTRACT].join('\n\n');
+    .join('\n\n');
+  const report = reportExcerpt
+    ? `Report excerpt:\n${String(reportExcerpt).slice(0, MAX_REPORT_EXCERPT)}`
+    : null;
+  const sections = [
+    { text: head, marker: COMPOSER_PERSONA_TRUNCATED },
+    // The composer runs ONE-SHOT with no MCP configuration, so the annex it
+    // receives is the tool-less form: every answer whose channel is a platform
+    // tool is rewritten onto the proposal it returns, and it raises no
+    // checkpoint. Appending the raw annex told a promoted fork's composer to
+    // call tools its own session does not have.
+    hasInvokeToken(persona, knowledge)
+      ? {
+          text: invokeDialectAnnex({
+            toolless: true,
+            checkpointLogInvoked: invokesCheckpointLog(persona, knowledge),
+          }),
+        }
+      : null,
+    { text: PLATFORM_ENVIRONMENT },
+    { text: MODE_TASKS[mode] },
+    { text: `Intent:\n${intentPrompt || '(none provided)'}` },
+    instructions ? { text: `Requester instructions:\n${instructions}` } : null,
+    repoSignals
+      ? {
+          text: `Workspace signals (advisory — runtime detection is authoritative):\n${JSON.stringify(repoSignals, null, 2)}`,
+        }
+      : null,
+    report ? { text: report, marker: REPORT_EXCERPT_TRUNCATED } : null,
+    progressContext ? { text: `Live stage progress:\n${progressContext}` } : null,
+    grounding ? { text: String(grounding) } : null,
+    { text: contract },
+  ].filter(Boolean);
+  const whole = joinSections(sections.map(({ text }) => text));
   if (whole.length <= CONTEXT_LIMIT) return whole;
-  // The output contract is appended whole after the cut. If the rest still does
-  // not fit once the persona and knowledge are gone, its end (the grounding) is
-  // cut too; the mode task comes first in it, so it stays.
-  const budget = CONTEXT_LIMIT - PROPOSAL_CONTRACT.length - 2;
-  const rest = tail.join('\n\n');
-  const room = Math.max(0, budget - rest.length - COMPOSER_PERSONA_TRUNCATED.length - 3);
-  const body = [`${head.join('\n\n').slice(0, room)}\n${COMPOSER_PERSONA_TRUNCATED}`, rest]
-    .join('\n\n')
-    .slice(0, budget);
-  return `${body}\n\n${PROPOSAL_CONTRACT}`;
+
+  // Space left for the two bounded sections once every required section and
+  // every separator is counted. They split it evenly, and a section that needs
+  // less than its half gives the rest to the other.
+  const bounded = sections.filter(({ marker }) => marker);
+  const fixed = whole.length - bounded.reduce((sum, { text }) => sum + text.length, 0);
+  const room = Math.max(0, CONTEXT_LIMIT - fixed);
+  const [first, second] = bounded;
+  const share = new Map();
+  if (second) {
+    const half = Math.floor(room / 2);
+    const firstShare = Math.max(half, room - second.text.length);
+    share.set(first, Math.min(first.text.length, firstShare));
+    share.set(second, room - share.get(first));
+  } else if (first) {
+    share.set(first, room);
+  }
+  const cut = (section) => {
+    const limit = share.get(section);
+    if (limit === undefined || section.text.length <= limit) return section.text;
+    // A cut section never takes more than its share, even when the share is
+    // smaller than its marker: it keeps the marker alone if that fits, and
+    // gives way entirely otherwise.
+    const keep = limit - section.marker.length - 1;
+    if (keep > 0) return `${section.text.slice(0, keep)}\n${section.marker}`;
+    return section.marker.length <= limit ? section.marker : '';
+  };
+  const budgeted = joinSections(sections.map(cut));
+  if (budgeted.length <= CONTEXT_LIMIT) return budgeted;
+  // The required sections alone do not fit: keep the output contract whole and
+  // cut what precedes it at the limit.
+  const body = joinSections(sections.slice(0, -1).map(cut)).slice(
+    0,
+    CONTEXT_LIMIT - contract.length - 2,
+  );
+  return `${body}\n\n${contract}`;
 };
 
 export const createComposePlanStart = ({
@@ -232,6 +379,16 @@ export const createComposePlanStart = ({
       // methodology the intent will actually run.
       methodologyRelease = null,
       methodologyPins = null,
+      // The per-intent AI-DLC settings this intent already runs with. The
+      // composer must see them to propose a VALID change, and seeing them here
+      // is what lets the annex forbid it hunting for them on disk.
+      aidlcSettings = null,
+      // The scope whose own settings the intent currently runs with: its base
+      // scope when the selection is a composed grid, its scope otherwise. The
+      // effective settings are that scope's values with the recorded overrides
+      // on top, so the composer is grounded in what the run WOULD do rather
+      // than in the subset a member happened to change.
+      policyScope = null,
       prompt = '',
       instructions = '',
       repoSignals = null,
@@ -307,12 +464,29 @@ export const createComposePlanStart = ({
         const scopeBlocks = methodologyRelease
           ? await listReleaseBlocksFn('SCOPE', methodologyRelease, methodologyPins)
           : await listMergedBlocksFn('SCOPE').catch(() => []);
-        const { scopes, summaries, grids, stages, offeredScopeIds } = buildScopeGrounding({
-          workflow,
-          library,
-          scopeBlocks,
+        const { scopes, summaries, grids, stages, scopeSettings, offeredScopeIds } =
+          buildScopeGrounding({ workflow, library, scopeBlocks });
+        // The per-intent settings exist only for a release that authors at least
+        // one of them. Gating the settings grounding AND the richer output
+        // contract on the CATALOG — never on a version string — is what keeps
+        // the compose prompt of every older pinned release byte-for-byte what
+        // it was.
+        const settingsAware = scopes.some(
+          (scope) => Object.keys(scopeAidlcSettings(scope)).length > 0,
+        );
+        const settingsScopeBlock =
+          scopes.find((scope) => (scope.id ?? scope.blockId) === policyScope) ?? null;
+        const grounding = buildGroundingPack({
+          scopes,
+          summaries,
+          grids,
+          stages,
+          scopeSettings,
+          settingsScopeId: settingsAware ? (policyScope ?? null) : null,
+          effectiveSettings: settingsAware
+            ? effectiveAidlcSettingRows(aidlcSettings, scopeAidlcSettings(settingsScopeBlock))
+            : [],
         });
-        const grounding = buildGroundingPack({ scopes, summaries, grids, stages });
 
         // Composer persona + methodology knowledge from the block library
         // (fork-shadowing applies — a user's edited composer is honoured).
@@ -336,6 +510,7 @@ export const createComposePlanStart = ({
           repoSignals,
           reportExcerpt,
           progressContext,
+          settingsAware,
         });
 
         g = await openGraph();
@@ -417,11 +592,19 @@ export const createComposePlanStart = ({
             proposal.grid[stageId] = value;
           }
         }
-        const { validation, error: validationError } = validateProposal({
+        const {
+          validation,
+          settingsScope,
+          settingsAuthored,
+          error: validationError,
+        } = validateProposal({
           proposal,
           workflow,
           library,
+          scopeBlocks,
           offeredScopeIds,
+          policyScope,
+          settingsAware,
           strict: mode === 'inflight',
         });
         if (validationError) {
@@ -434,7 +617,19 @@ export const createComposePlanStart = ({
           });
           return;
         }
-        await finish({ state: 'COMPLETED', fields: { proposal, validation } });
+        // The settings scope the proposal was validated against, and that
+        // scope's authored defaults, are recorded on the row, so Apply
+        // normalises the accepted values against the SAME authored map the
+        // validation used instead of re-deriving one from whatever selection
+        // the page happens to preview.
+        await finish({
+          state: 'COMPLETED',
+          fields: {
+            proposal,
+            validation,
+            ...(settingsScope ? { settingsScope, settingsAuthored } : {}),
+          },
+        });
       } catch (err) {
         log(`job failed (${key}):`, err?.message ?? err);
         await finish({
@@ -455,4 +650,13 @@ export const createComposePlanStart = ({
   return start;
 };
 
-export { buildScopeGrounding, validateProposal, buildComposePrompt, scopeGridFor };
+export {
+  CONTEXT_LIMIT as COMPOSE_CONTEXT_LIMIT,
+  MAX_REPORT_EXCERPT,
+  PLATFORM_ENVIRONMENT,
+  buildScopeGrounding,
+  settingsScopeFor,
+  validateProposal,
+  buildComposePrompt,
+  scopeGridFor,
+};
