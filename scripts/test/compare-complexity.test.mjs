@@ -123,14 +123,14 @@ test('compares against merge base, not target tip, and reports only relevant cha
   repo.put('frontend/src/types.d.ts', 'not valid declarations {{{');
   repo.put('scripts/ignored.mjs', 'not valid JavaScript {{{');
   repo.put('eslint.config.mjs', 'throw new Error("Never load PR configuration");');
-  const head = repo.commit('feature');
-  // Dirty work is not part of the committed-head comparison.
+  const pr = repo.commit('feature');
+  // Dirty work is not part of the committed PR comparison.
   repo.put('lambda/demo/index.js', 'not valid JavaScript {{{');
 
   const report = await compareRevisions({ cwd: repo.cwd, base: 'main', baseRef: 'main' });
   assert.equal(report.baseRef, 'main');
   assert.equal(report.mergeBase, ancestor);
-  assert.equal(report.head, head);
+  assert.equal(report.pr, pr);
   assert.notEqual(report.base, ancestor);
   assert.deepEqual(
     report.findings.map(({ function: name, before, after, kind }) => ({
@@ -164,6 +164,34 @@ test('compares against merge base, not target tip, and reports only relevant cha
   assert.equal(
     readFileSync(join(repo.cwd, 'reports/complexity/comparison.md'), 'utf8'),
     cli.stdout,
+  );
+  const details = JSON.parse(readFileSync(join(repo.cwd, 'reports/complexity/complexity.json')));
+  assert.deepEqual(details.files, report.files);
+  assert.equal(details.mergeBase, ancestor);
+  assert.equal(details.pr, pr);
+  const detailMarkdown = readFileSync(join(repo.cwd, 'reports/complexity/complexity.md'), 'utf8');
+  assert.match(detailMarkdown, /\| Base \| small \| \d+ \| 1 \|/);
+  assert.match(detailMarkdown, /\| PR \| small \| \d+ \| 2 \|/);
+  assert.match(detailMarkdown, /\| PR \| stable \| \d+ \| 40 \|/);
+  assert.match(detailMarkdown, /Previously: lambda\/demo\/original.js/);
+  assert.match(detailMarkdown, /\| Base \| deleted \|/);
+  assert.doesNotMatch(detailMarkdown, /\| PR \| deleted \|/);
+  const dependencies = JSON.parse(
+    readFileSync(join(repo.cwd, 'reports/complexity/dependencies.json')),
+  );
+  assert.deepEqual(dependencies.files, report.dependencies);
+  assert.equal(dependencies.pr, pr);
+  assert.deepEqual(
+    dependencies.files.find((file) => file.path === 'lambda/demo/deleted.js'),
+    {
+      path: 'lambda/demo/deleted.js',
+      importers: null,
+      reason: 'File deleted in PR',
+    },
+  );
+  assert.equal(
+    dependencies.files.find((file) => file.path === 'frontend/src/new.ts').reason,
+    'Backend only',
   );
   assert.match(cli.stdout, /unknown \(no report supplied\)/);
   const skipped = spawnSync(process.execPath, [script, '--base', 'main', '--coverage-not-needed'], {
@@ -200,7 +228,7 @@ test('recognizes unchanged moved functions and shifted callbacks without guessin
   assert.equal(report.findings[0].delta, null);
 });
 
-test('counts unique direct production importers at committed head for every function in a file', async (t) => {
+test('counts unique direct production importers at the PR commit for every function in a file', async (t) => {
   const repo = repository(t);
   repo.put(
     'lambda/shared/hot.js',
@@ -235,7 +263,7 @@ test('counts unique direct production importers at committed head for every func
     );
   }
   repo.put('.dependency-cruiser.cjs', "throw new Error('must not load PR configuration');");
-  repo.commit('head');
+  repo.commit('pr');
   repo.put('lambda/dirty/index.js', "import '../shared/hot.js';");
   repo.put(
     'lambda/one/index.js',
@@ -247,6 +275,40 @@ test('counts unique direct production importers at committed head for every func
     report.findings.map((row) => row.dependentFiles),
     [7, 7],
   );
+  assert.deepEqual(
+    report.dependencies.find((file) => file.path === 'lambda/shared/hot.js').importers,
+    [
+      'lambda/duplicate-a/index.js',
+      'lambda/duplicate-b/index.js',
+      'lambda/four/index.js',
+      'lambda/one/index.js',
+      'lambda/three/index.cjs',
+      'lambda/two/index.js',
+      'lambda/unicode/café\nmodule.js',
+    ],
+  );
+  assert.deepEqual(
+    report.dependencies.find((file) => file.path === 'lambda/one/index.js').importers,
+    ['lambda/transitive/index.js'],
+  );
+});
+
+test('dependency details include changed files even when no function is flagged', async (t) => {
+  const repo = repository(t);
+  repo.put('lambda/shared/calm.js', `export ${branchFunction('calm', 1)}`);
+  repo.put('lambda/demo/index.js', "import '../shared/calm.js';");
+  const base = repo.commit('base');
+  repo.put('lambda/shared/calm.js', `export ${branchFunction('calm', 2)}`);
+  repo.commit('small change');
+  const report = await compareRevisions({ cwd: repo.cwd, base });
+  assert.deepEqual(report.findings, []);
+  assert.deepEqual(report.dependencies, [
+    {
+      path: 'lambda/shared/calm.js',
+      importers: ['lambda/demo/index.js'],
+      reason: null,
+    },
+  ]);
 });
 
 test('suppresses unchanged identical callbacks by count and flags only additional copies', async () => {
@@ -323,7 +385,7 @@ test('caps the display without dropping JSON findings and escapes Markdown conte
   };
   const report = {
     mergeBase: 'abc',
-    head: 'def',
+    pr: 'def',
     analyzer: { threshold: 15 },
     files: [],
     findings: Array.from({ length: 21 }, () => finding),
@@ -383,13 +445,14 @@ test('attributes nested outcomes separately and distinguishes missing coverage f
   );
 });
 
-test('test-only coverage regressions expose existing complex functions and reject mismatched instrumentation', async (t) => {
+test('coverage regressions only report files changed by the PR and reject mismatched instrumentation', async (t) => {
   const repo = repository(t);
   const source = branchFunction('risky', 20);
   repo.put('lambda/demo/index.js', source);
+  repo.put('lambda/demo/unchanged.js', source);
   const base = repo.commit('base');
   repo.put('lambda/demo/test/test.js', '// tests changed');
-  const head = repo.commit('test only');
+  const testOnlyPr = repo.commit('test only');
   const snapshot = (revision, hit) => ({
     status: 'complete',
     revision,
@@ -399,19 +462,43 @@ test('test-only coverage regressions expose existing complex functions and rejec
         sourceHash: sourceHash(source),
         branches: [{ start: { line: 2, column: 0 }, hit }],
       },
+      'lambda/demo/unchanged.js': {
+        sourceHash: sourceHash(source),
+        branches: [{ start: { line: 2, column: 0 }, hit }],
+      },
     },
   });
   const baseCoverage = snapshot(base, true);
-  const headCoverage = snapshot(head, false);
-  const report = await compareRevisions({ cwd: repo.cwd, base, baseCoverage, headCoverage });
+  const testOnlyReport = await compareRevisions({
+    cwd: repo.cwd,
+    base,
+    baseCoverage,
+    prCoverage: snapshot(testOnlyPr, false),
+  });
+  assert.deepEqual(testOnlyReport.files, []);
+  assert.deepEqual(testOnlyReport.findings, []);
+  assert.deepEqual(testOnlyReport.improvements, []);
+  // A file edit without a complexity change must still expose coverage regressions.
+  const changedSource = source.replace('return -1;', 'return -2;');
+  repo.put('lambda/demo/index.js', changedSource);
+  const pr = repo.commit('source changed');
+  const prCoverage = snapshot(pr, false);
+  prCoverage.files['lambda/demo/index.js'].sourceHash = sourceHash(changedSource);
+  const report = await compareRevisions({ cwd: repo.cwd, base, baseCoverage, prCoverage });
+  assert.deepEqual(
+    report.files.map((file) => file.path),
+    ['lambda/demo/index.js'],
+  );
+  assert.deepEqual(report.improvements, []);
   assert.equal(report.findings.length, 1);
+  assert.equal(report.findings[0].path, 'lambda/demo/index.js');
   assert.equal(report.findings[0].kind, 'coverage-decreased');
   assert.equal(report.findings[0].delta, 0);
   assert.equal(report.findings[0].coverage.change.percentagePoints, -100);
   assert.match(renderComparison(report), /100.0% → 0.0%/);
   // Crash the actual dependency-cruiser child, leaving the comparison CLI running.
   repo.put('base-coverage.json', JSON.stringify(baseCoverage));
-  repo.put('head-coverage.json', JSON.stringify(headCoverage));
+  repo.put('pr-coverage.json', JSON.stringify(prCoverage));
   repo.put(
     'crash-depcruise.cjs',
     `
@@ -426,10 +513,12 @@ test('test-only coverage regressions expose existing complex functions and rejec
       script,
       '--base',
       base,
+      '--pr',
+      pr,
       '--base-coverage',
       'base-coverage.json',
-      '--head-coverage',
-      'head-coverage.json',
+      '--pr-coverage',
+      'pr-coverage.json',
     ],
     {
       cwd: repo.cwd,
@@ -453,26 +542,41 @@ test('test-only coverage regressions expose existing complex functions and rejec
   assert.match(crashed.stdout, /100.0% → 0.0%/);
   assert.doesNotMatch(crashed.stdout, /Report unavailable|simulated dependency-cruiser crash/);
   assert.match(crashed.stderr, /Dependency analysis failed:.*simulated dependency-cruiser crash/s);
-  headCoverage.status = 'partial';
-  const partial = await compareRevisions({ cwd: repo.cwd, base, baseCoverage, headCoverage });
+  const dependencyDetails = JSON.parse(
+    readFileSync(join(repo.cwd, 'reports/complexity/dependencies.json'), 'utf8'),
+  );
+  assert.deepEqual(dependencyDetails.files, [
+    {
+      path: 'lambda/demo/index.js',
+      importers: null,
+      reason: 'Dependency analysis unavailable',
+    },
+  ]);
+  assert.match(
+    readFileSync(join(repo.cwd, 'reports/complexity/complexity.md'), 'utf8'),
+    /\| PR \| risky \| \d+ \| 20 \| 0.0% \| 1 \|/,
+  );
+  prCoverage.status = 'partial';
+  const partial = await compareRevisions({ cwd: repo.cwd, base, baseCoverage, prCoverage });
   assert.equal(partial.findings[0].coverage.change.percentagePoints, -100);
   assert.equal(partial.findings[0].coverage.after.partial, true);
   assert.match(renderComparison(partial), /100.0% → 0.0%\*/);
   assert.match(
     renderComparison(partial),
-    /Head coverage: measured with failing or interrupted tests/,
+    /PR coverage: measured with failing or interrupted tests/,
   );
-  headCoverage.status = 'complete';
-  headCoverage.instrumenter.vitest = 'different';
-  const incompatible = await compareRevisions({ cwd: repo.cwd, base, baseCoverage, headCoverage });
+  prCoverage.status = 'complete';
+  prCoverage.instrumenter.vitest = 'different';
+  const incompatible = await compareRevisions({ cwd: repo.cwd, base, baseCoverage, prCoverage });
   assert.equal(incompatible.findings.length, 0);
   assert.match(incompatible.coverageNotes[0], /differs/);
   const unavailable = await compareRevisions({
     cwd: repo.cwd,
     base,
     baseCoverage,
-    headCoverage: { status: 'unavailable', revision: head, files: {} },
+    prCoverage: { status: 'unavailable', revision: pr, files: {} },
   });
-  assert.equal(unavailable.files.length, 0);
-  assert.match(renderComparison(unavailable), /Head coverage: unknown.*failed/);
+  assert.equal(unavailable.files.length, 1);
+  assert.equal(unavailable.findings.length, 0);
+  assert.match(renderComparison(unavailable), /PR coverage: unknown.*failed/);
 });

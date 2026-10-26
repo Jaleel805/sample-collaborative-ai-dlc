@@ -26,11 +26,11 @@ jobs:
       - id: refs
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          merge_base=$(git merge-base "$BASE_SHA" "$PR_SHA")
           echo "merge-base=$merge_base" >> "$GITHUB_OUTPUT"
-          if git diff --quiet "$merge_base" "$HEAD_SHA" -- lambda/ test/ \
+          if git diff --quiet "$merge_base" "$PR_SHA" -- lambda/ test/ \
             'package*.json' vitest.config.js eslint.complexity.config.mjs \
             'scripts/*complexity*' 'scripts/test/*complexity*' '.github/workflows/pr-quality*'; then
             echo "coverage-needed=false" >> "$GITHUB_OUTPUT"
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        revision: [base, head]
+        revision: [base, pr]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -181,7 +181,7 @@ jobs:
               attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
             });
             core.setOutput('base', names.base);
-            core.setOutput('head', names.head);
+            core.setOutput('pr', names.pr);
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         if: steps.artifacts.outputs.base != ''
         continue-on-error: true
@@ -189,15 +189,15 @@ jobs:
           name: ${{ steps.artifacts.outputs.base }}
           path: coverage-input/base
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: steps.artifacts.outputs.head != ''
+        if: steps.artifacts.outputs.pr != ''
         continue-on-error: true
         with:
-          name: ${{ steps.artifacts.outputs.head }}
-          path: coverage-input/head
+          name: ${{ steps.artifacts.outputs.pr }}
+          path: coverage-input/pr
       - name: Compare complexity and coverage
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           COVERAGE_NEEDED: ${{ needs.revisions.outputs.coverage-needed }}
         run: |
@@ -206,14 +206,26 @@ jobs:
           if [ -f "coverage-input/base/coverage.json" ]; then
             args+=(--base-coverage "coverage-input/base/coverage.json")
           fi
-          if [ -f "coverage-input/head/coverage.json" ]; then
-            args+=(--head-coverage "coverage-input/head/coverage.json")
+          if [ -f "coverage-input/pr/coverage.json" ]; then
+            args+=(--pr-coverage "coverage-input/pr/coverage.json")
           fi
-          npm run complexity:compare -- --base "$BASE_SHA" --base-ref "$BASE_REF" --head "$HEAD_SHA" "${args[@]}"
+          npm run complexity:compare -- --base "$BASE_SHA" --base-ref "$BASE_REF" --pr "$PR_SHA" "${args[@]}"
           cat reports/complexity/comparison.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pr-quality-${{ github.run_attempt }}
-          path: reports/complexity/comparison.*
+          path: reports/complexity/comparison.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: complexity-${{ github.run_attempt }}
+          path: reports/complexity/complexity.*
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependencies-${{ github.run_attempt }}
+          path: reports/complexity/dependencies.*
           if-no-files-found: error
           retention-days: 7

@@ -72,8 +72,7 @@ export function renderComparison(report) {
   const lines = [
     '# Complexity and test coverage',
     '',
-    `Merge base \`${cell(report.mergeBase)}\` → head \`${cell(report.head)}\`.`,
-    `Analyzed ${report.files.length} source files with source or coverage changes. Advisory threshold: ${report.analyzer.threshold}.`,
+    `Analyzed ${report.files.length} source files changed by this PR. Advisory threshold: ${report.analyzer.threshold}.`,
     '',
     `${report.findings.length} new/unmatched or worsening functions above the threshold.`,
   ];
@@ -90,16 +89,61 @@ export function renderComparison(report) {
   }
   lines.push(
     '',
-    'With comparable data: 🟢 Improving without either metric worsening · 🟠 Mixed or small changes · 🔴 Large net regression · 🟣 Both worsen substantially.',
-    'Without comparable data: use current complexity—🟢 ≤15, 🟠 >15, 🔴 >50, 🟣 >100. Measured head coverage below 50% raises the color one level; unknown coverage leaves it unchanged.',
-    'Depending files = direct production importers of the file at PR head (backend only; excludes tests and AWS/external callers). More than 10 raises an existing warning one level, capped at purple, when coverage is below 50% or regresses. Improvements stay green.',
-    'Comparison scale: complexity Δ / max(5, 20% of base complexity), minus coverage Δ / 10 percentage points. Net ≥ 1 is red; both worsening by ≥ 1 unit is purple. Icons are review heuristics, not correctness guarantees; * measurements also make the icon provisional.',
-    'Review order: coverage regressions first, then uncovered branch count, then complexity increase.',
-    'Branch coverage uses backend Vitest/V8 outcomes assigned to the innermost function. * = measured with failing or interrupted tests; coverage and deltas may be incomplete. Frontend and missing data are unknown; n/a means no measured outcomes. Coverage Δ is measured in percentage points.',
-    'Unchanged existing complexity is omitted unless coverage regresses. Improvements do not offset findings.',
-    'New or unmatched means no confident function match was found; no increase is inferred.',
-    'Advisory review aid, not a correctness guarantee or merge gate.',
+    '🟢 Improving · 🟠 Needs attention · 🔴 High risk · 🟣 Highest risk',
+    '',
+    'unknown = unavailable · n/a = no branches · \\* = incomplete tests',
     '',
   );
   return lines.join('\n');
+}
+
+export function renderComplexityDetails(report) {
+  const lines = [
+    '# Complexity details',
+    '',
+    'All functions in PR-changed files, including those below the advisory threshold.',
+    '',
+    'unknown = unavailable · n/a = no branches · \\* = incomplete tests',
+  ];
+  for (const note of report.coverageNotes ?? []) lines.push('', cell(note));
+  if (!report.files.length) lines.push('', 'No source files changed.');
+  for (const file of report.files) {
+    lines.push('', `## ${cell(file.path)}`);
+    if (file.previousPath && file.previousPath !== file.path) {
+      lines.push('', `Previously: ${cell(file.previousPath)}`);
+    }
+    lines.push(
+      '',
+      '| Revision | Function | Line | Complexity | Branch coverage | Uncovered branches |',
+      '| --- | --- | ---: | ---: | ---: | ---: |',
+    );
+    for (const [revision, functions] of [
+      ['Base', file.before],
+      ['PR', file.after],
+    ]) {
+      for (const fn of functions) {
+        lines.push(
+          `| ${revision} | ${cell(fn.name)} | ${fn.line} | ${fn.score} | ${percent(fn.coverage)} | ${uncovered(fn.coverage)} |`,
+        );
+      }
+    }
+    if (!file.before.length && !file.after.length) lines.push('', 'No functions.');
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+export function renderDependencyDetails(report) {
+  const lines = [
+    '# Depending files',
+    '',
+    'Direct production importers at the PR commit. Backend only; excludes tests and external callers.',
+  ];
+  if (!report.dependencies.length) lines.push('', 'No source files changed.');
+  for (const file of report.dependencies) {
+    lines.push('', `## ${cell(file.path)}`, '');
+    if (file.importers === null) lines.push(cell(file.reason));
+    else if (!file.importers.length) lines.push('No direct production importers.');
+    else lines.push(...file.importers.map((path) => `- ${cell(path)}`));
+  }
+  return `${lines.join('\n')}\n`;
 }

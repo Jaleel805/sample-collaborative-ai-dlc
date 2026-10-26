@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { changeIcon, renderComparison } from '../complexity-report.mjs';
+import {
+  changeIcon,
+  renderComparison,
+  renderComplexityDetails,
+  renderDependencyDetails,
+} from '../complexity-report.mjs';
 
 const row = (before, after, coverageDelta) => ({
   path: 'lambda/demo/index.js',
@@ -10,6 +15,32 @@ const row = (before, after, coverageDelta) => ({
   after,
   delta: before === null ? null : after - before,
   coverage: { change: { percentagePoints: coverageDelta } },
+});
+
+test('detail artifacts include every function and importer, with escaped Markdown', () => {
+  const functions = Array.from({ length: 25 }, (_, index) => ({
+    name: `fn${index}|<tag>`,
+    line: index + 1,
+    score: 1,
+    coverage: { status: 'measured', percent: 50, uncovered: 1 },
+  }));
+  const report = {
+    files: [{ path: 'lambda/a|b.js', before: functions, after: functions }],
+    dependencies: [
+      {
+        path: 'lambda/a|b.js',
+        importers: Array.from({ length: 25 }, (_, index) => `lambda/${index}|<tag>.js`),
+      },
+    ],
+  };
+  const complexity = renderComplexityDetails(report);
+  assert.equal(complexity.split('\n').filter((line) => /^\| (Base|PR) \|/.test(line)).length, 50);
+  assert.match(complexity, /fn24&#124;&#60;tag&#62;/);
+  assert.doesNotMatch(complexity, /<tag>|Showing 20/);
+  const dependencies = renderDependencyDetails(report);
+  assert.equal(dependencies.split('\n').filter((line) => line.startsWith('- ')).length, 25);
+  assert.match(dependencies, /lambda\/24&#124;&#60;tag&#62;.js/);
+  assert.match(renderDependencyDetails({ dependencies: [] }), /No source files changed/);
 });
 
 test('green requires improvement without a worsening metric', () => {
@@ -58,7 +89,7 @@ test('missing comparisons use current complexity, with strict threshold boundari
   assert.equal(changeIcon({ ...row(50, 70, -20), coverage: undefined }), '🔴');
 });
 
-test('low measured head coverage escalates current risk, but unknown and branchless coverage do not', () => {
+test('low measured PR coverage escalates current risk, but unknown and branchless coverage do not', () => {
   const current = (score, percent, status = 'measured') => ({
     ...row(null, score, null),
     coverage: { after: { status, percent } },
@@ -72,10 +103,10 @@ test('low measured head coverage escalates current risk, but unknown and branchl
   assert.equal(changeIcon(current(70, null, 'unknown')), '🔴');
 });
 
-test('Markdown uses a leading icon instead of the Signal column, with an explanatory legend', () => {
+test('Markdown keeps the table and a compact two-line legend', () => {
   const report = {
     mergeBase: 'a'.repeat(40),
-    head: 'b'.repeat(40),
+    pr: 'b'.repeat(40),
     analyzer: { threshold: 15 },
     files: [],
     findings: [{ ...row(50, 60, -10), dependentFiles: 12 }],
@@ -85,8 +116,14 @@ test('Markdown uses a leading icon instead of the Signal column, with an explana
   assert.match(markdown, /\| 🟣 \| lambda\/demo\/index.js/);
   assert.match(markdown, /\| 🟢 \| lambda\/demo\/index.js/);
   assert.doesNotMatch(markdown, /\| Signal \|/);
-  assert.match(markdown, /Without comparable data: use current complexity/);
-  assert.match(markdown, /Icons are review heuristics/);
+  assert.doesNotMatch(markdown, /Merge base|a{40}|b{40}/);
+  assert.ok(
+    markdown.endsWith(
+      '🟢 Improving · 🟠 Needs attention · 🔴 High risk · 🟣 Highest risk\n\n' +
+        'unknown = unavailable · n/a = no branches · \\* = incomplete tests\n',
+    ),
+  );
+  assert.ok(markdown.length < 1500, 'A two-row report should stay brief');
   assert.match(markdown, /\| Depending files \|/);
   assert.match(markdown, /\| 12 \|/);
   assert.match(markdown, /\| unknown \|/);

@@ -24,7 +24,7 @@ function validCoverage(value) {
 export function validateReport(report) {
   if (
     report?.schemaVersion !== 1 ||
-    ![report.base, report.mergeBase, report.head].every(sha) ||
+    ![report.base, report.mergeBase, report.pr].every(sha) ||
     !text(report.baseRef) ||
     !report.baseRef ||
     !(report.dependencyNote === undefined || text(report.dependencyNote)) ||
@@ -88,7 +88,7 @@ export async function qualityArtifactNames({ github, repo, runId, attempt }) {
   const names = {};
   for (const [role, jobName, prefix] of [
     ['base', 'coverage-base', 'coverage-base'],
-    ['head', 'coverage-head', 'coverage-head'],
+    ['pr', 'coverage-pr', 'coverage-pr'],
     ['report', 'report', 'pr-quality'],
   ]) {
     const producer = jobs
@@ -162,7 +162,7 @@ export async function publishComplexityComment({
       pr.head.repo?.id !== run.head_repository?.id
     )
       continue;
-    if (report && report.head !== pr.head.sha) continue;
+    if (report && report.pr !== pr.head.sha) continue;
     const comments = await github.paginate(github.rest.issues.listComments, {
       ...repo,
       issue_number: pr.number,

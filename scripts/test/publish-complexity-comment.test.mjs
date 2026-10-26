@@ -14,13 +14,13 @@ import {
 } from '../publish-complexity-comment.mjs';
 
 const base = 'a'.repeat(40);
-const head = 'b'.repeat(40);
+const prSha = 'b'.repeat(40);
 const report = () => ({
   schemaVersion: 1,
   baseRef: 'main',
   base,
   mergeBase: base,
-  head,
+  pr: prSha,
   analyzer: { threshold: 15 },
   files: [],
   coverageNotes: [],
@@ -52,7 +52,7 @@ async function fixture(t, contents = report()) {
   const pr = {
     number: 42,
     state: 'open',
-    head: { sha: head, repo: { id: 2 } },
+    head: { sha: prSha, repo: { id: 2 } },
     base: { sha: base, ref: 'main' },
   };
   const comments = [];
@@ -69,7 +69,7 @@ async function fixture(t, contents = report()) {
         run_attempt: 1,
         repository: { id: 1 },
         head_repository: { id: 2 },
-        head_sha: head,
+        head_sha: prSha,
       },
     },
   };
@@ -80,7 +80,7 @@ async function fixture(t, contents = report()) {
     rest: {
       repos: {
         compareCommitsWithBasehead: async (input) => {
-          assert.equal(input.basehead, `main...${head}`);
+          assert.equal(input.basehead, `main...${prSha}`);
           return { data: { merge_base_commit: { sha: base } } };
         },
       },
@@ -130,7 +130,7 @@ test('updates only the bot-owned marked comment and ignores stale reruns', async
   assert.deepEqual(f.writes, []);
 });
 
-test('does not post stale head, wrong repository, or a non-PR workflow', async (t) => {
+test('does not post stale PR commit, wrong repository, or a non-PR workflow', async (t) => {
   for (const change of [
     (f) => {
       f.pr.head.sha = 'c'.repeat(40);
@@ -175,7 +175,7 @@ test('validates numbers and derives coverage deltas rather than trusting the art
       r.findings[0].after = 'injection';
     },
     (r) => {
-      r.head = '<!-- injected -->';
+      r.pr = '<!-- injected -->';
     },
     (r) => {
       r.findings[0].coverage.after.percent = 100;
@@ -332,11 +332,11 @@ test('report rerun reuses coverage from producers that were not rerun', async ()
   assert.deepEqual(
     await selectArtifacts([
       job('coverage-base', 1),
-      job('coverage-head', 1),
+      job('coverage-pr', 1),
       job('report', 1, 'failure'),
       job('report', 2, null),
     ]),
-    { base: 'coverage-base-1', head: 'coverage-head-1', report: 'pr-quality-2' },
+    { base: 'coverage-base-1', pr: 'coverage-pr-1', report: 'pr-quality-2' },
   );
 });
 
@@ -357,14 +357,14 @@ test('failed producer rerun never falls back to an older artifact', async () => 
   assert.deepEqual(
     await selectArtifacts([
       job('coverage-base', 1),
-      job('coverage-head', 1),
+      job('coverage-pr', 1),
       job('report', 1),
-      job('coverage-head', 2, 'failure'),
+      job('coverage-pr', 2, 'failure'),
       job('report', 2, 'failure'),
       job('coverage-base', 3),
       job('report', 3),
     ]),
-    { base: 'coverage-base-1', head: 'coverage-head-2', report: 'pr-quality-2' },
+    { base: 'coverage-base-1', pr: 'coverage-pr-2', report: 'pr-quality-2' },
   );
 });
 
@@ -373,9 +373,9 @@ test('skipped producers do not supply old measurements', async () => {
     await selectArtifacts([
       job('coverage-base', 1),
       job('coverage-base', 2, 'skipped'),
-      job('coverage-head', 2, 'skipped'),
+      job('coverage-pr', 2, 'skipped'),
     ]),
-    { base: '', head: '', report: '' },
+    { base: '', pr: '', report: '' },
   );
 });
 
@@ -393,7 +393,17 @@ test('both workflow paths download selected producer artifacts and call the shar
     const checkout = steps.find((step) => step.uses.startsWith('actions/checkout@'));
     assert.equal(checkout.with['persist-credentials'], false);
     if (file === 'pr-quality-comment.yml') assert.equal(checkout.with.ref, undefined);
-    else assert.equal(checkout.with.ref, '${{ github.event.pull_request.head.sha }}');
+    else {
+      assert.equal(checkout.with.ref, '${{ github.event.pull_request.head.sha }}');
+      const uploads = workflow.jobs.report.steps
+        .filter((step) => step.uses?.startsWith('actions/upload-artifact@'))
+        .map((step) => [step.with.name, step.with.path]);
+      assert.deepEqual(uploads, [
+        ['pr-quality-${{ github.run_attempt }}', 'reports/complexity/comparison.json'],
+        ['complexity-${{ github.run_attempt }}', 'reports/complexity/complexity.*'],
+        ['dependencies-${{ github.run_attempt }}', 'reports/complexity/dependencies.*'],
+      ]);
+    }
   }
 });
 
@@ -457,7 +467,7 @@ test('workflow skips backend suites for docs, Terraform and frontend but detects
       env: {
         ...process.env,
         BASE_SHA: baseSha,
-        HEAD_SHA: git('rev-parse', 'HEAD'),
+        PR_SHA: git('rev-parse', 'HEAD'),
         GITHUB_OUTPUT: output,
       },
     });

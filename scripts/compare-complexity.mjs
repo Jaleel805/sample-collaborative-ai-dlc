@@ -15,7 +15,11 @@ import {
   summarizeFunctions,
 } from './complexity-analysis.mjs';
 import { attachCoverage, hasCoverage } from './complexity-coverage.mjs';
-import { renderComparison } from './complexity-report.mjs';
+import {
+  renderComparison,
+  renderComplexityDetails,
+  renderDependencyDetails,
+} from './complexity-report.mjs';
 export { renderComparison } from './complexity-report.mjs';
 
 const require = createRequire(import.meta.url);
@@ -34,16 +38,10 @@ function resolveCommit(cwd, ref) {
   return git(cwd, ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]).trim();
 }
 
-function changedFiles(cwd, base, head) {
-  const fields = git(cwd, [
-    'diff',
-    '--name-status',
-    '-z',
-    '--find-renames',
-    base,
-    head,
-    '--',
-  ]).split('\0');
+function changedFiles(cwd, base, pr) {
+  const fields = git(cwd, ['diff', '--name-status', '-z', '--find-renames', base, pr, '--']).split(
+    '\0',
+  );
   const files = [];
   for (let index = 0; fields[index];) {
     const status = fields[index++];
@@ -52,7 +50,7 @@ function changedFiles(cwd, base, head) {
     files.push({
       path,
       previousPath: status === 'A' ? null : oldPath,
-      headPath: status === 'D' ? null : path,
+      prPath: status === 'D' ? null : path,
     });
   }
   return files;
@@ -76,12 +74,12 @@ async function measure(cwd, analyzer, revision, path, coverage) {
   );
 }
 
-async function dependentFileCounts(cwd, analyzer, head) {
+async function dependentFiles(cwd, analyzer, pr) {
   const snapshot = await mkdtemp(join(tmpdir(), 'complexity-dependencies-'));
   try {
     const counts = new Map();
     const files = [];
-    const entries = git(cwd, ['ls-tree', '-r', '-z', head, '--', 'lambda', 'package.json']).split(
+    const entries = git(cwd, ['ls-tree', '-r', '-z', pr, '--', 'lambda', 'package.json']).split(
       '\0',
     );
     for (const entry of entries.filter(Boolean)) {
@@ -91,7 +89,7 @@ async function dependentFileCounts(cwd, analyzer, head) {
         (await analyzer.calculateConfigForFile(resolve(cwd, path)))?.rules?.[complexityRule];
       if (!source && !path.endsWith('package.json')) continue;
       const blob = /^100(?:644|755) blob ([a-f0-9]+)\t/.exec(entry);
-      if (!blob) throw new Error(`${head}:${path}: expected a regular file`);
+      if (!blob) throw new Error(`${pr}:${path}: expected a regular file`);
       files.push({ path, objectId: blob[1] });
       if (source) counts.set(path, new Set());
     }
@@ -151,7 +149,7 @@ async function dependentFileCounts(cwd, analyzer, head) {
         }
       }
     }
-    return new Map([...counts].map(([path, importers]) => [path, importers.size]));
+    return new Map([...counts].map(([path, importers]) => [path, [...importers].toSorted()]));
   } finally {
     await rm(snapshot, { recursive: true, force: true });
   }
@@ -160,20 +158,20 @@ async function dependentFileCounts(cwd, analyzer, head) {
 export async function compareRevisions({
   cwd,
   base = 'origin/main',
-  head = 'HEAD',
+  pr = 'HEAD',
   baseRef,
   baseCoverage,
-  headCoverage,
+  prCoverage,
   coverageNotNeeded = false,
 }) {
   const baseSha = resolveCommit(cwd, base);
-  const headSha = resolveCommit(cwd, head);
-  const mergeBase = git(cwd, ['merge-base', baseSha, headSha]).trim();
+  const prSha = resolveCommit(cwd, pr);
+  const mergeBase = git(cwd, ['merge-base', baseSha, prSha]).trim();
   const analyzer = createAnalyzer(cwd);
   const coverageNotes = [];
   for (const [label, snapshot, revision] of [
     ['Merge-base', baseCoverage, mergeBase],
-    ['Head', headCoverage, headSha],
+    ['PR', prCoverage, prSha],
   ]) {
     if (!snapshot) {
       coverageNotes.push(
@@ -193,44 +191,25 @@ export async function compareRevisions({
   }
   if (
     hasCoverage(baseCoverage) &&
-    hasCoverage(headCoverage) &&
-    JSON.stringify(baseCoverage.instrumenter) !== JSON.stringify(headCoverage.instrumenter)
+    hasCoverage(prCoverage) &&
+    JSON.stringify(baseCoverage.instrumenter) !== JSON.stringify(prCoverage.instrumenter)
   ) {
     coverageNotes.push(
       'Coverage is unknown: Node, Vitest, provider, or coverage configuration differs.',
     );
     baseCoverage = undefined;
-    headCoverage = undefined;
+    prCoverage = undefined;
   }
-  const candidates = changedFiles(cwd, mergeBase, headSha);
-  // Test-only changes can expose existing complex functions. Include files whose
-  // measured branch outcomes changed, even when their source did not.
-  if (
-    hasCoverage(baseCoverage) &&
-    hasCoverage(headCoverage) &&
-    baseCoverage.revision === mergeBase &&
-    headCoverage.revision === headSha
-  ) {
-    const included = new Set(candidates.flatMap((file) => [file.path, file.previousPath]));
-    for (const [path, next] of Object.entries(headCoverage.files)) {
-      const old = baseCoverage.files[path];
-      if (
-        !included.has(path) &&
-        old &&
-        JSON.stringify(old.branches) !== JSON.stringify(next.branches)
-      ) {
-        candidates.push({ path, previousPath: path, headPath: path });
-      }
-    }
-  }
+  const candidates = changedFiles(cwd, mergeBase, prSha);
   const files = [];
   for (const file of candidates) {
     const before = await measure(cwd, analyzer, mergeBase, file.previousPath, baseCoverage);
-    const after = await measure(cwd, analyzer, headSha, file.headPath, headCoverage);
+    const after = await measure(cwd, analyzer, prSha, file.prPath, prCoverage);
     if (before === null && after === null) continue;
     files.push({
       path: file.path,
       previousPath: file.previousPath,
+      prPath: file.prPath,
       before: before ?? [],
       after: after ?? [],
       summary: {
@@ -243,21 +222,32 @@ export async function compareRevisions({
   const rows = [...comparison.findings, ...comparison.improvements];
   let dependents = new Map();
   let dependencyNote;
-  if (rows.some((row) => row.path.startsWith('lambda/'))) {
+  if (files.some((file) => file.prPath?.startsWith('lambda/'))) {
     try {
-      dependents = await dependentFileCounts(cwd, analyzer, headSha);
+      dependents = await dependentFiles(cwd, analyzer, prSha);
     } catch (error) {
       console.warn(`Dependency analysis failed: ${error.message}`);
       dependencyNote = 'Depending files: unknown (dependency analysis failed).';
     }
   }
-  for (const row of rows) row.dependentFiles = dependents.get(row.path) ?? null;
+  for (const row of rows) row.dependentFiles = dependents.get(row.path)?.length ?? null;
+  const dependencies = files.map((file) => ({
+    path: file.path,
+    importers: dependents.get(file.prPath) ?? null,
+    reason: !file.prPath
+      ? 'File deleted in PR'
+      : !file.prPath.startsWith('lambda/')
+        ? 'Backend only'
+        : dependents.has(file.prPath)
+          ? null
+          : 'Dependency analysis unavailable',
+  }));
   return {
     schemaVersion: 1,
     base: baseSha,
     baseRef,
     mergeBase,
-    head: headSha,
+    pr: prSha,
     coverageNotes,
     ...(dependencyNote ? { dependencyNote } : {}),
     analyzer: {
@@ -268,6 +258,7 @@ export async function compareRevisions({
       threshold: complexityThreshold,
     },
     files,
+    dependencies,
     ...comparison,
   };
 }
@@ -276,11 +267,11 @@ async function main() {
   const { values } = parseArgs({
     options: {
       base: { type: 'string', default: 'origin/main' },
-      head: { type: 'string', default: 'HEAD' },
+      pr: { type: 'string', default: 'HEAD' },
       'base-ref': { type: 'string' },
       'output-dir': { type: 'string', default: 'reports/complexity' },
       'base-coverage': { type: 'string' },
-      'head-coverage': { type: 'string' },
+      'pr-coverage': { type: 'string' },
       'coverage-not-needed': { type: 'boolean', default: false },
     },
   });
@@ -288,10 +279,10 @@ async function main() {
   const report = await compareRevisions({
     cwd,
     base: values.base,
-    head: values.head,
+    pr: values.pr,
     baseRef: values['base-ref'],
     baseCoverage: await loadCoverage(values['base-coverage']),
-    headCoverage: await loadCoverage(values['head-coverage']),
+    prCoverage: await loadCoverage(values['pr-coverage']),
     coverageNotNeeded: values['coverage-not-needed'],
   });
   const markdown = renderComparison(report);
@@ -299,6 +290,17 @@ async function main() {
   await mkdir(outputDir, { recursive: true });
   await writeFile(join(outputDir, 'comparison.json'), `${JSON.stringify(report, null, 2)}\n`);
   await writeFile(join(outputDir, 'comparison.md'), markdown);
+  const { schemaVersion, mergeBase, pr, analyzer, coverageNotes, files, dependencies } = report;
+  await writeFile(
+    join(outputDir, 'complexity.json'),
+    `${JSON.stringify({ schemaVersion, mergeBase, pr, analyzer, coverageNotes, files }, null, 2)}\n`,
+  );
+  await writeFile(join(outputDir, 'complexity.md'), renderComplexityDetails(report));
+  await writeFile(
+    join(outputDir, 'dependencies.json'),
+    `${JSON.stringify({ schemaVersion, pr, scope: 'Direct production importers, backend only', files: dependencies }, null, 2)}\n`,
+  );
+  await writeFile(join(outputDir, 'dependencies.md'), renderDependencyDetails(report));
   process.stdout.write(markdown);
 }
 
